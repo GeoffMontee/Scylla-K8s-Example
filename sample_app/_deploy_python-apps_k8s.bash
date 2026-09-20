@@ -35,6 +35,7 @@ appshm="128Mi"
 
 if [[ ${delete} == "-d" ]]; then
   kubectl --namespace=${clusterNamespace} delete pod/${appName} --ignore-not-found=true
+  kubectl --namespace=${clusterNamespace} delete role,rolebinding python-k8s-access --ignore-not-found=true
 else
 #k8sNodeCount=1 
 #while [ $n -lt $num ]; do
@@ -42,6 +43,15 @@ else
 
 #if [[ ${useCache} == true ]]; then
   kubectl -n "${clusterNamespace}" delete pod/"${appName}" --ignore-not-found --wait --timeout=120s
+
+  # Kubernetes access for the scripts that run inside the pod - see
+  # python-k8s-access.yaml for what it grants and why. The only substitution is
+  # the ServiceAccount subject, which follows clusterName like the pod's own
+  # serviceAccountName below.
+  sed "s/name: scylla-member/name: ${clusterName}-member/" \
+    "${SCRIPT_DIR}/python-k8s-access.yaml" |
+    kubectl -n "${clusterNamespace}" apply -f=-
+
   kubectl -n ${clusterNamespace} apply --server-side -f=- <<EOF
 apiVersion: v1
 kind: Pod
