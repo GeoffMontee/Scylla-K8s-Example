@@ -8,29 +8,21 @@ import sys
 import argparse
 from asyncio import sleep
 from datetime import datetime, timedelta
-from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
-from cassandra.auth import PlainTextAuthProvider
 from cassandra import ConsistencyLevel
-from cassandra.policies import DCAwareRoundRobinPolicy, TokenAwarePolicy, WhiteListRoundRobinPolicy
+from scylla_conn import add_connection_args, build_cluster_and_session, log_auth, resolve_connection
 
 parser = argparse.ArgumentParser(description='ScyllaDB table query script')
-parser.add_argument('-s', '--hosts', default="127.0.0.1", help='Comma-separated ScyllaDB node Names or IPs')
-parser.add_argument('-u', '--username', default="cassandra", help='ScyllaDB username')
-parser.add_argument('-p', '--password', default="cassandra", help='ScyllaDB password')
+add_connection_args(parser)
 parser.add_argument('-k', '--keyspace', default="mykeyspace", help='Keyspace name')
 parser.add_argument('-t', '--table', default="myTable", help='Table name')
 parser.add_argument('-r', '--row_count', type=int, action="store", dest="row_count", default=100000)
 parser.add_argument('-o', '--offset', type=int, default=0, help='ID offset (must match loader)')
-parser.add_argument('-l', '--local_only', action="store_true", help='Use local-only mode')
 parser.add_argument('--cl', dest="consistency_level", default="LOCAL_QUORUM", help="Consistency Level (ONE, TWO, QUORUM, ALL, LOCAL_QUORUM, EACH_QUORUM)")
-parser.add_argument('--dc', default='dc1', help='Local datacenter name for ScyllaDB')
 parser.add_argument('--minutes', type=int, default=60, help='How long to run (minutes)')
 parser.add_argument('--interval', type=float, default=1.0, help='Delay between queries (seconds)')
 parser.add_argument('--buckets', type=int, default=256, help='Partition bucket count (must match loader: id %% buckets)',)
 opts = parser.parse_args()
 
-hosts = [h.strip() for h in opts.hosts.split(',') if h.strip()]
-username = opts.username
 password = opts.password
 row_count = int(opts.row_count)
 id_offset = int(opts.offset)
@@ -48,47 +40,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info(f"Connecting to cluster: {hosts} with user {opts.username}")
+hosts, port, username = resolve_connection(opts, logger)
+
 logger.info(f"Using keyspace: {opts.keyspace}, table: {opts.table}")
 logger.info(f"Local DC: {opts.dc}")
 logger.info(f"Using consistency level: {opts.consistency_level}") 
 logger.info(f"Row count to query: {opts.row_count}, id offset: {id_offset}, buckets: {num_buckets}")
 
 class TableQueryRunner:
-    def __init__(self, hosts, keyspace, table, username, password):
+    def __init__(self, hosts, port, keyspace, table, username, password):
         self.hosts = hosts
         self.keyspace = keyspace
         self.table = table
         self.query_count = 0
         self.error_count = 0
         try:
-            is_local_only = (hosts and hosts[0] in ('127.0.0.1', 'localhost')) or opts.local_only
-            if is_local_only:
-                # For a single node connection, shard-awareness should be disabled.
-                # This prevents the driver from trying to connect to other discovered nodes.
-                logger.info(f"Using WhiteListRoundRobinPolicy with hosts: {hosts}")
-                policy = WhiteListRoundRobinPolicy(hosts)
-            else:
-                logger.info(f"Using TokenAwarePolicy with local_dc: {dc}")
-                policy = TokenAwarePolicy(DCAwareRoundRobinPolicy(local_dc=dc))
-
-            profile = ExecutionProfile(load_balancing_policy=policy, request_timeout=30)
-                
-            self.cluster = Cluster(
-                contact_points= hosts,
-                shard_aware_options=dict(disable=is_local_only),
-                auth_provider=PlainTextAuthProvider(username=username, password=password),
-                execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-                protocol_version=4,
-                connect_timeout=30,
-                control_connection_timeout=30
+            self.cluster, self.session = build_cluster_and_session(
+                hosts, port, username, password, dc, opts.local_only
             )
-
-            self.session = self.cluster.connect()
             self.session.set_keyspace(self.keyspace)
             logger.info(f"Connected to cluster: {self.hosts}")
             logger.info(f"Using keyspace: {self.keyspace}, table: {self.table}")
-            logger.info(f"Authentication successful for user: {username}, password: {'*' * len(password)}")
+            log_auth(username, password, logger)
         except Exception as e:
             logger.error(f"Failed to connect to cluster: {e}")
             sys.exit(1)
@@ -163,7 +136,7 @@ def main():
     if num_buckets < 1:
         logger.error("--buckets must be >= 1")
         sys.exit(1)
-    runner = TableQueryRunner(hosts, keyspace, table, username, password)
+    runner = TableQueryRunner(hosts, port, keyspace, table, username, password)
     try:
         runner.run_for_duration(duration_minutes=opts.minutes,
                                 query_interval_seconds=opts.interval)

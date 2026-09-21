@@ -7,22 +7,17 @@ import random
 import sys
 import argparse
 from faker import Faker
-from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra import ConsistencyLevel
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import DCAwareRoundRobinPolicy, TokenAwarePolicy, RoundRobinPolicy
+from scylla_conn import add_connection_args, build_cluster_and_session, log_auth, resolve_connection
 
 ## Script args and Help
 parser = argparse.ArgumentParser(add_help=True)
-parser.add_argument('-s', '--hosts', default="127.0.0.1", help='Comma-separated ScyllaDB node Names or IPs')
-parser.add_argument('-u', '--username', default="cassandra", help='ScyllaDB username')
-parser.add_argument('-p', '--password', default="cassandra", help='ScyllaDB password')
+add_connection_args(parser)
 parser.add_argument('-k', '--keyspace', default="mykeyspace", help='Keyspace name')
 parser.add_argument('-t', '--table', default="mySlowTable", help='Table name')
 parser.add_argument('-r', '--row_count', type=int, action="store", dest="row_count", default=10000)
 parser.add_argument('-d', '--drop', action="store_true", help='Drop keyspace if exists')
 parser.add_argument('--cl', dest="consistency_level", default="LOCAL_QUORUM", help="Consistency Level (ONE, TWO, QUORUM, ALL, LOCAL_QUORUM, EACH_QUORUM)")
-parser.add_argument('--dc', dest='local_dc', default='dc1', help='Local datacenter name for ScyllaDB')
 parser.add_argument(
     '--buckets',
     type=int,
@@ -31,11 +26,9 @@ parser.add_argument(
 )
 opts = parser.parse_args()
 
-hosts = [h.strip() for h in opts.hosts.split(',') if h.strip()]
-username = opts.username
 password = opts.password
 row_count = int(opts.row_count)
-local_datacenter = opts.local_dc
+local_datacenter = opts.dc
 consistency_level = opts.consistency_level
 ## Define KS + Table
 keyspace = opts.keyspace
@@ -51,9 +44,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info(f"Connected to cluster: {hosts}")
+hosts, port, username = resolve_connection(opts, logger)
+
 logger.info(f"Using keyspace: {keyspace}, table: {table}")
-logger.info(f"Authentication successful for user: {username}, password: {'*' * len(password)}")
 logger.info(f"Local DC: {local_datacenter}")
 logger.info(f"Row count to insert: {row_count}, buckets: {num_buckets}")
 logger.info(f"Using consistency level: {consistency_level}") 
@@ -148,31 +141,15 @@ def insert_data(session, row_count, table, compression, buckets):
 
 if __name__ == "__main__":
     try:
-        if hosts[0] == '127.0.0.1':
-            profile = ExecutionProfile(load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=local_datacenter), request_timeout=30)
-            cluster = Cluster(hosts, 
-                auth_provider=PlainTextAuthProvider(username=username, password=password),
-                execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-                protocol_version=4, 
-                connect_timeout=30, 
-                control_connection_timeout=30 )
-        else:
-            profile = ExecutionProfile(load_balancing_policy=TokenAwarePolicy(DCAwareRoundRobinPolicy(local_dc=local_datacenter)))
-            cluster = Cluster(
-                contact_points=hosts,
-                auth_provider=PlainTextAuthProvider(username=username, password=password),
-                execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-                protocol_version=4,
-                connect_timeout=30,
-                control_connection_timeout=30)
-
-        session = cluster.connect()
+        cluster, session = build_cluster_and_session(
+            hosts, port, username, password, local_datacenter, opts.local_only
+        )
         if drop_keyspace:
             logger.info(f"Dropping keyspace {keyspace} if exists")
             session.execute(f"""DROP KEYSPACE if exists {keyspace};""")
         logger.info(f"Connected to cluster: {hosts}")
         logger.info(f"Using keyspace: {keyspace}, table: {table}")
-        logger.info(f"Authentication successful for user: {username}, password: {'*' * len(password)}")
+        log_auth(username, password, logger)
     except Exception as e:
         logger.error(f"Failed to connect to cluster: {e}")
         sys.exit(1)

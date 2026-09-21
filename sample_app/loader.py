@@ -10,14 +10,10 @@ import os
 from math import ceil
 from faker import Faker
 from multiprocessing import get_context, cpu_count
-from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra import ConsistencyLevel
-from cassandra.policies import DCAwareRoundRobinPolicy, TokenAwarePolicy, WhiteListRoundRobinPolicy, RoundRobinPolicy, HostFilterPolicy, DefaultLoadBalancingPolicy
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.connection import UnixSocketEndPoint
 from cassandra.query import SimpleStatement, ordered_dict_factory, TraceUnavailable
-from ssl import SSLContext, TLSVersion, CERT_REQUIRED, PROTOCOL_TLS_CLIENT
+from scylla_conn import add_connection_args, build_cluster_and_session, resolve_connection
 
 # Constants
 COMPRESSION = "'sstable_compression': 'ZstdWithDictsCompressor'"
@@ -30,12 +26,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-s', '--hosts', default="127.0.0.1:9042", help='Comma-separated ScyllaDB node Names or IPs')
-    parser.add_argument('-l', '--local_only', action="store_true", help='Use local-only mode')
-    parser.add_argument('-m', '--mtls', action="store_true", help='Use mtls for authentication (overrides username/password)')
-    parser.add_argument('-e', '--tls', action="store_true", help='Use tls for connection with username/password)')
-    parser.add_argument('-u', '--username', default="cassandra", help='ScyllaDB username')
-    parser.add_argument('-p', '--password', default="cassandra", help='ScyllaDB password')
+    add_connection_args(parser)
     parser.add_argument('-k', '--keyspace', default="myKeyspace", help='Keyspace name')
     parser.add_argument('--rf', type=int, default=3, help='Replication factor for the keyspace (default 3)')
     parser.add_argument('-t', '--table', default="myTable", help='Table name')
@@ -43,7 +34,6 @@ def parse_args():
     parser.add_argument('-r', '--row_count', type=int, default=100000, help='Number of rows to insert')
     parser.add_argument('-b', '--batch_size', type=int, default=2000, help='Batch size for inserts')
     parser.add_argument('--cl', default="LOCAL_QUORUM", help="Consistency Level (ONE, TWO, QUORUM, etc.)")
-    parser.add_argument('--dc', default='dc1', help='Local datacenter name for ScyllaDB')
     parser.add_argument('-w', '--workers', type=int, default=0, help='Number of worker processes (0 = cpu_count())')
     parser.add_argument('-o', '--offset', type=int, default=0, help='Offset for ID generation to avoid collisions across runs')
     parser.add_argument('--buckets', type=int, default=256, help='Number of partition buckets (id %% buckets). More buckets = less hotspot risk per partition.')
@@ -112,74 +102,6 @@ def _init_worker_rng(worker_index):
     random.seed(seed)
     Faker.seed(seed)
 
-def _build_cluster_and_session(hosts, port, username, password, dc, local_only):
-    is_local_only = (hosts and hosts[0] in ('127.0.0.1', 'localhost')) or local_only
-
-    if is_local_only:
-        logging.info("Local-only mode: HostFilterPolicy + no discovery")
-        policy = HostFilterPolicy(
-            child_policy=RoundRobinPolicy(),
-            predicate=lambda host: host.address == hosts[0]
-        )
-        profile = ExecutionProfile(
-            load_balancing_policy=policy,
-            request_timeout=30,
-            consistency_level=ConsistencyLevel.ONE
-        )
-        shard_aware_opts = {"disable": True}
-        pv = 3
-        md = False
-    else:
-        logging.info(f"Using TokenAwarePolicy with local_dc: {dc}")
-        policy = TokenAwarePolicy(DCAwareRoundRobinPolicy(local_dc=dc))
-        profile = ExecutionProfile(
-            load_balancing_policy=policy,
-            request_timeout=30,
-        )
-        shard_aware_opts = {"disable": False}  # shard-aware for cluster
-        pv = 4
-        md = True
-
-    # TLS setup
-    if port == "9142":
-        ssl_context = SSLContext(PROTOCOL_TLS_CLIENT)
-        ssl_context.minimum_version = TLSVersion.TLSv1_2
-        ssl_context.maximum_version = TLSVersion.TLSv1_3
-        ssl_context.load_verify_locations('./config/ca.crt')
-        ssl_context.verify_mode = CERT_REQUIRED
-        ssl_context.load_cert_chain(certfile='./config/tls.crt', keyfile='./config/tls.key')
-        ssl_options = {'server_hostname': hosts[0]}  # Add SNI
-    else:
-        ssl_context = None
-        ssl_options = None
-
-    # Common cluster params
-    common_kwargs = {
-        'contact_points': hosts,
-        'port': int(port),
-        'ssl_context': ssl_context,
-        'ssl_options': ssl_options,
-        'execution_profiles': {EXEC_PROFILE_DEFAULT: profile},
-        'shard_aware_options': shard_aware_opts,
-        'protocol_version': pv,
-        'connect_timeout': 30,
-        'control_connection_timeout': 1,
-        'schema_metadata_enabled': md,
-        'token_metadata_enabled': md,
-    }
-    
-    if username == "mtls":
-        cluster = Cluster(**common_kwargs)
-    else:
-        common_kwargs['auth_provider'] = PlainTextAuthProvider(username=username, password=password)
-        cluster = Cluster(**common_kwargs)
-
-    logging.info(f"Connecting: hosts={hosts}, port={port}, auth={username}, local_only={is_local_only}")
-    session = cluster.connect()
-    logging.info("Session created successfully")
-    return cluster, session
-
-
 def _worker_insert_range(
     worker_index,
     hosts,
@@ -200,7 +122,7 @@ def _worker_insert_range(
     # Per-process RNG
     _init_worker_rng(worker_index)
     fake = Faker()
-    cluster, session = _build_cluster_and_session(hosts, port, username, password, dc, local_only)
+    cluster, session = build_cluster_and_session(hosts, port, username, password, dc, local_only)
     try:
         # Prepare statement per worker
         cql = f"""INSERT INTO {keyspace}.{table} (bucket, id, ssn, imei, os, phonenum, balance, pdate, message) VALUES (?,?,?,?,?,?,?,?, ?)"""
@@ -250,7 +172,7 @@ def insert_data_parallel(
     num_buckets,
 ):
     # One control session in parent to create schema (safe and simple)
-    ctrl_cluster, ctrl_session = _build_cluster_and_session(hosts, port, username, password, dc, local_only)
+    ctrl_cluster, ctrl_session = build_cluster_and_session(hosts, port, username, password, dc, local_only)
     try:
         create_schema(ctrl_session, keyspace, table, tablets, compression, rf)
     finally:
@@ -316,38 +238,7 @@ def insert_data_parallel(
 
 def main():
     opts = parse_args()
-    hosts = [h.strip().split(':')[0] for h in opts.hosts.split(',') if h.strip()]
-    parts = opts.hosts.strip().split(':')
-    port=parts[1] if len(parts) > 1 else "9042"
-
-    # Pre-flight check for required TLS configuration files
-    username = opts.username
-    if opts.mtls or opts.tls:
-        config_dir = './config'
-        required_files = [
-            os.path.join(config_dir, 'ca.crt'),
-            os.path.join(config_dir, 'tls.crt'),
-            os.path.join(config_dir, 'tls.key')
-        ]
-
-        # Check if the config path exists and is a directory (or a symlink to one)
-        if not os.path.lexists(config_dir) or not os.path.isdir(config_dir):
-            logger.error(f"TLS config directory not found or is not a directory: '{config_dir}'")
-            logger.error("Please ensure './config' exists and is a directory or a symbolic link to a directory.")
-            sys.exit(1)
-
-        for f_path in required_files:
-            if not os.path.isfile(f_path):
-                logger.error(f"Required TLS file not found: {f_path}")
-                sys.exit(1)
-        if opts.mtls:
-            logger.info(f"Connecting to cluster: {hosts} with mTLS authentication")
-            username = "mtls"  # Special username to trigger mTLS in _build_cluster_and_session
-        else:
-            logger.info(f"Connecting to cluster: {hosts} with username/password authentication with TLS: {username}")
-        port = "9142"  # Default mTLS port, adjust if your cluster uses a different one
-    else:
-        logger.info(f"Connecting to cluster: {hosts}:{port} with username/password authentication: {username}")
+    hosts, port, username = resolve_connection(opts, logger)
 
     logger.info(f"Using keyspace: {opts.keyspace}, table: {opts.table}, rf: {opts.rf}")
     logger.info(f"Local DC: {opts.dc}")
@@ -367,7 +258,7 @@ def main():
     try:
         if opts.drop:
             # Use ephemeral parent session to drop keyspace to avoid races
-            cluster, session = _build_cluster_and_session(hosts, port, username, opts.password, opts.dc, opts.local_only)
+            cluster, session = build_cluster_and_session(hosts, port, username, opts.password, opts.dc, opts.local_only)
             try:
                 logger.info(f"Dropping table {opts.keyspace}.{opts.table} if exists.")
                 session.execute(f"DROP TABLE IF EXISTS {opts.keyspace}.{opts.table};")

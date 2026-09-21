@@ -60,6 +60,10 @@ def main():
         "INSERT INTO example (id, value) VALUES (%s, %s)",
         (1, "hello through proxy")
     )
+    session.execute(
+        "INSERT INTO example (id, value) VALUES (%s, %s)",
+        (2, "I found something")
+    )
 
     rows = session.execute(SimpleStatement("SELECT id, value FROM example"))
     for row in rows:

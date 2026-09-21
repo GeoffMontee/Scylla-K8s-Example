@@ -3,29 +3,34 @@
 
 import time
 import datetime
+import logging
 import random
 import argparse
 import random
-from cassandra.cluster import Cluster
 from cassandra import ConsistencyLevel
 from cassandra.concurrent import execute_concurrent_with_args
-from cassandra.auth import PlainTextAuthProvider
+from scylla_conn import add_connection_args, build_cluster_and_session, resolve_connection
 
 ## Script args and Help
 parser = argparse.ArgumentParser(add_help=True)
-parser.add_argument('-s', '--hosts', default="127.0.0.1", help='Comma-separated ScyllaDB node Names or IPs')
-parser.add_argument('-u', '--username', default="cassandra", help='ScyllaDB username')
-parser.add_argument('-p', '--password', default="cassandra", help='ScyllaDB password')
+add_connection_args(parser)
 parser.add_argument('-k', '--keyspace', default="mykeyspace", help='Keyspace name')
+parser.add_argument('-r', '--row_count', type=int, default=10000, help='Number of rows to insert')
 opts = parser.parse_args()
 
-hosts = [h.strip() for h in opts.hosts.split(',') if h.strip()]
-username = opts.username
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 password = opts.password
 row_count = int(opts.row_count)
 ## Define KS + Table
 keyspace = opts.keyspace
 tablets = "true"
+
+hosts, port, username = resolve_connection(opts, logger)
 
 print ("hosts: %s" % hosts)
 print ("row_count: %d" % row_count)
@@ -82,8 +87,9 @@ def insert_data(session, row_count, table, compression):
 if __name__ == "__main__":
     table = [ "myTable" ]
     compression = [ "'sstable_compression': 'ZstdCompressor'" ]
-    cluster = Cluster(hosts, auth_provider=PlainTextAuthProvider(username, password))
-    session = cluster.connect()
+    cluster, session = build_cluster_and_session(
+        hosts, port, username, password, opts.dc, opts.local_only
+    )
     numtable= len(table) 
     for i in range(numtable):
         print("")
@@ -91,7 +97,7 @@ if __name__ == "__main__":
         t = table[i]
         c = compression[i]
         insert_data(session, row_count, t, c)
-    session.shutdown()       # or, preferably, cluster.shutdown()
+    cluster.shutdown()
     now = datetime.datetime.now()
     print(now.strftime("%Y-%m-%d %H:%M:%S"))
 

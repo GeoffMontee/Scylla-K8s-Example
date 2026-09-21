@@ -145,6 +145,8 @@ Under `sample_app/` you can build images and deploy workloads with scripts such 
 
 Top-level Python examples in `sample_app/` include **`loader.py`**, **`query.py`**, **`slow_loader.py`**, **`test_compression.py`**, **`tombstone.py`**, and **`proxy.py`** (see each file’s usage).
 
+**`scylla_conn.py`** holds the connection code shared by `loader.py`, `query.py`, `slow_loader.py`, and `tombstone.py`, so those four take the same connection flags: `-s host[:port]`, `-u`, `-p`, `--dc`, `-e/--tls`, `-m/--mtls`, and `-l/--local_only`. Use `-l` when the client reaches the cluster through a single endpoint it can route to — a `kubectl port-forward`, typically. In that mode every node address the cluster advertises is translated to the contact point, since the pod IPs returned by node discovery are not reachable from outside the cluster; shard-aware and token-aware routing are disabled to match. Without `-l` the driver discovers and connects to all nodes normally, which is what you want from inside the cluster (`run_app_k8s.bash`).
+
 Subdirectories (each may have its own README, Makefile, or `run_it.bash`):
 
 
