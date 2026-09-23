@@ -1,0 +1,47 @@
+# Required OCI target. Copy this file to oke.conf and replace these values.
+OCI_REGION="us-sanjose-1"
+OCI_COMPARTMENT_OCID="ocid1.compartment.oc1..replace-me"
+
+# OCI CLI profile and resource names.
+OCI_CLI_PROFILE="DEFAULT"
+OKE_CLUSTER_NAME="scylladb-demo"
+OKE_VCN_NAME="${OKE_CLUSTER_NAME}-vcn"
+
+# Leave empty to use the newest Kubernetes version supported by OKE in the region.
+K8S_VERSION=""
+# Leave empty to use the first availability domain returned for the compartment.
+OCI_AD=""
+
+# General-purpose pool for the operator, monitoring, Manager, and MinIO.
+GENERAL_NODE_SHAPE="VM.Standard.E4.Flex"
+GENERAL_NODE_OCPUS=4
+GENERAL_NODE_MEMORY_GBS=32
+GENERAL_NODE_COUNT=1
+
+# Dedicated ScyllaDB pool. Dense I/O shapes provide the local NVMe devices
+# consumed by local-csi-driver/nodeconfigOKE.yaml.
+SCYLLA_NODE_SHAPE="VM.DenseIO.E4.Flex"
+SCYLLA_NODE_OCPUS=8
+SCYLLA_NODE_MEMORY_GBS=128
+# The repository deploys three one-member racks, one per OCI fault domain.
+SCYLLA_NODE_COUNT=3
+
+# Optional x86 application pool, matching nodeSelector2=application in init.conf.
+CREATE_APPLICATION_POOL=false
+APPLICATION_NODE_SHAPE="VM.Standard.E4.Flex"
+APPLICATION_NODE_OCPUS=2
+APPLICATION_NODE_MEMORY_GBS=16
+APPLICATION_NODE_COUNT=1
+
+NODE_BOOT_VOLUME_GBS=100
+
+# The provisioning flow creates a new VCN. Change these if they overlap with
+# networks connected to this VCN.
+VCN_CIDR="10.0.0.0/16"
+CONTROL_PLANE_SUBNET_CIDR="10.0.0.0/24"
+WORKER_SUBNET_CIDR="10.0.1.0/24"
+LOAD_BALANCER_SUBNET_CIDR="10.0.2.0/24"
+
+# Public API and load-balancer ingress. Restrict these CIDRs for production.
+API_INGRESS_CIDR="0.0.0.0/0"
+LOAD_BALANCER_INGRESS_CIDR="0.0.0.0/0"

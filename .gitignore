@@ -66,6 +66,7 @@ test*
 my*
 docker-compose*
 gcs-service-account.json
+makeK8s_OKE/oke.conf
 scylla*.yaml
 nodeconfig.yaml
 gcp_init.conf
