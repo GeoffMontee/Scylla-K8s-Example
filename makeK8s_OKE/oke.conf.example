@@ -40,10 +40,18 @@ SCYLLA_NODE_AD=""
 SCYLLA_NODE_FAULT_DOMAINS_JSON='["FAULT-DOMAIN-1","FAULT-DOMAIN-2","FAULT-DOMAIN-3"]'
 # The script automatically checks dense-io2-core-count at 8 units per node for
 # VM.DenseIO2.8 and refuses to create a partial pool when fewer than 24 units
-# are available. When choosing another Dense I/O family, set that family's
-# OCI limit name and units consumed per node so the same preflight can run.
+# are available. DenseIO.E4 and DenseIO.E5 shapes are also mapped to their OCI
+# core limits automatically. For any other family, set that family's OCI limit
+# name and units consumed per node so the same preflight can run.
 # SCYLLA_NODE_LIMIT_NAME="dense-io2-core-count"
 # SCYLLA_NODE_LIMIT_UNITS_PER_NODE=8
+#
+# Example regional fallback when live OKE options and limit availability show
+# VM.DenseIO.E5.Flex with at least 24 dense-io-e5-core-count units:
+# OCI_REGION="us-phoenix-1"
+# SCYLLA_NODE_SHAPE="VM.DenseIO.E5.Flex"
+# SCYLLA_NODE_OCPUS=8
+# SCYLLA_NODE_MEMORY_GBS=96
 
 # Optional x86 application pool, matching nodeSelector2=application in init.conf.
 CREATE_APPLICATION_POOL=false

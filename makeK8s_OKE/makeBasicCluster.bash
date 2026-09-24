@@ -84,7 +84,7 @@ check_scylla_node_limit() {
     "${SCYLLA_NODE_LIMIT_NAME}" "${SCYLLA_NODE_AD}" "${used:-unknown}" \
     "${available}" "${required}"
   if ((available < required)); then
-    die "insufficient ${SCYLLA_NODE_LIMIT_NAME} for the complete ${SCYLLA_NODE_COUNT}-node ${SCYLLA_NODE_SHAPE} pool: ${required} units are required but only ${available} are available. No Scylla pool was created. Free capacity, request a service-limit increase, or configure another OKE-supported Dense I/O shape/availability domain and its SCYLLA_NODE_LIMIT_* mapping; the script will not reduce the three-node topology."
+    die "insufficient ${SCYLLA_NODE_LIMIT_NAME} for the complete ${SCYLLA_NODE_COUNT}-node ${SCYLLA_NODE_SHAPE} pool: ${required} units are required but only ${available} are available. No Scylla pool was created. Free capacity; request an increase with Subscription=None, using OCI Support when the standard form omits the limit; or configure another OKE-supported Dense I/O shape/availability domain. The script will not reduce the three-node topology."
   fi
 }
 
@@ -927,6 +927,12 @@ if [[ ${SCYLLA_NODE_LIMIT_NAME+x} != x ]]; then
     VM.DenseIO2.*|BM.DenseIO2.*)
       SCYLLA_NODE_LIMIT_NAME="dense-io2-core-count"
       ;;
+    VM.DenseIO.E4.*|BM.DenseIO.E4.*)
+      SCYLLA_NODE_LIMIT_NAME="dense-io-e4-core-count"
+      ;;
+    VM.DenseIO.E5.*|BM.DenseIO.E5.*)
+      SCYLLA_NODE_LIMIT_NAME="dense-io-e5-core-count"
+      ;;
     *)
       SCYLLA_NODE_LIMIT_NAME=""
       ;;
@@ -1002,6 +1008,12 @@ if [[ ${SCYLLA_NODE_SHAPE} == "VM.DenseIO.E4.Flex" ]]; then
   case "${SCYLLA_NODE_OCPUS}:${SCYLLA_NODE_MEMORY_GBS}" in
     8:128|16:256|32:512) ;;
     *) die "VM.DenseIO.E4.Flex supports 8:128, 16:256, or 32:512 OCPU:memory" ;;
+  esac
+fi
+if [[ ${SCYLLA_NODE_SHAPE} == "VM.DenseIO.E5.Flex" ]]; then
+  case "${SCYLLA_NODE_OCPUS}:${SCYLLA_NODE_MEMORY_GBS}" in
+    8:96|16:192|24:288|32:384|40:480|48:576) ;;
+    *) die "VM.DenseIO.E5.Flex supports 8:96, 16:192, 24:288, 32:384, 40:480, or 48:576 OCPU:memory" ;;
   esac
 fi
 if [[ ${CREATE_APPLICATION_POOL} == true ]]; then
