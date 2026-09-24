@@ -59,6 +59,48 @@ validate_positive_integer() {
   [[ $2 =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer (got '$2')"
 }
 
+check_scylla_node_limit() {
+  local availabilityJson
+  local available
+  local used
+  local required
+
+  [[ -n ${SCYLLA_NODE_LIMIT_NAME} ]] || return 0
+  capture_oci availabilityJson limits resource-availability get \
+    --service-name compute \
+    --limit-name "${SCYLLA_NODE_LIMIT_NAME}" \
+    --compartment-id "${OCI_COMPARTMENT_OCID}" \
+    --availability-domain "${SCYLLA_NODE_AD}" \
+    --region "${OCI_REGION}" \
+    --output json
+  available=$(jq -r '.data.available // empty' <<< "${availabilityJson}") \
+    || die "could not parse ${SCYLLA_NODE_LIMIT_NAME} availability"
+  used=$(jq -r '.data.used // empty' <<< "${availabilityJson}") \
+    || die "could not parse ${SCYLLA_NODE_LIMIT_NAME} usage"
+  [[ ${available} =~ ^[0-9]+$ ]] \
+    || die "OCI did not return integer availability for ${SCYLLA_NODE_LIMIT_NAME}"
+  required=$((SCYLLA_NODE_COUNT * SCYLLA_NODE_LIMIT_UNITS_PER_NODE))
+  printf "OCI limit %s in %s: used=%s available=%s required-for-pool=%s\n" \
+    "${SCYLLA_NODE_LIMIT_NAME}" "${SCYLLA_NODE_AD}" "${used:-unknown}" \
+    "${available}" "${required}"
+  if ((available < required)); then
+    die "insufficient ${SCYLLA_NODE_LIMIT_NAME} for the complete ${SCYLLA_NODE_COUNT}-node ${SCYLLA_NODE_SHAPE} pool: ${required} units are required but only ${available} are available. No Scylla pool was created. Free capacity, request a service-limit increase, or configure another OKE-supported Dense I/O shape/availability domain and its SCYLLA_NODE_LIMIT_* mapping; the script will not reduce the three-node topology."
+  fi
+}
+
+build_scylla_placement_configs() {
+  jq -cn \
+    --arg availabilityDomain "${SCYLLA_NODE_AD}" \
+    --arg subnetId "${OKE_WORKERS_SUBNET_OCID}" \
+    --argjson faultDomains "${SCYLLA_NODE_FAULT_DOMAINS_JSON}" \
+    '[{
+      availabilityDomain:$availabilityDomain,
+      subnetId:$subnetId,
+      faultDomains:$faultDomains
+    }]' \
+    || die "could not build Scylla node-pool placement configuration"
+}
+
 delete_context() {
   local contextName="${OKE_CLUSTER_NAME}-oke"
   local currentContext
@@ -99,14 +141,21 @@ preflight_create() {
 require_active_node_pool() {
   local poolName=$1
   local poolState
-  lookup_node_pool_state poolState "${poolName}"
-  [[ ${poolState} == "ACTIVE" ]] \
-    || die "OKE node pool ${poolName} did not become ACTIVE (state: ${poolState:-missing})"
+  local poolOcid
+  lookup_node_pool_state poolState poolOcid "${poolName}"
+  if [[ ${poolState} != "ACTIVE" ]]; then
+    if [[ -n ${poolOcid} ]] \
+        && ! oke_guard_node_pool_resume "${poolName}" "${poolOcid}" "${poolState}"; then
+      die "${OKE_NODE_POOL_ERROR:-OKE node pool ${poolName} did not become ACTIVE}"
+    fi
+    die "OKE node pool ${poolName} did not become ACTIVE (state: ${poolState:-missing})"
+  fi
 }
 
 lookup_node_pool_state() {
   local outputVariable=$1
-  local poolName=$2
+  local ocidVariable=$2
+  local poolName=$3
   local raw
   local matching
   local liveMatching
@@ -131,6 +180,8 @@ lookup_node_pool_state() {
   fi
   printf -v "${outputVariable}" '%s' \
     "$(jq -r '.[0]."lifecycle-state" // empty' <<< "${liveMatching}")"
+  printf -v "${ocidVariable}" '%s' \
+    "$(jq -r '.[0].id // empty' <<< "${liveMatching}")"
 }
 
 lookup_named_network_resource() {
@@ -297,12 +348,11 @@ wait_for_terminal_get() {
 delete_cluster_record() {
   local clusterOcid=$1
   local clusterState=$2
-  local deleteStatus
   if [[ ${clusterState} == "DELETING" ]]; then
     wait_for_terminal_get "OKE cluster" "${clusterOcid}" DELETED \
       ce cluster get --cluster-id "${clusterOcid}"
   else
-    capture_oci deleteStatus ce cluster delete \
+    run_oke_work_request "OKE cluster delete" ce cluster delete \
       --region "${OCI_REGION}" \
       --cluster-id "${clusterOcid}" \
       --force \
@@ -310,10 +360,7 @@ delete_cluster_record() {
       --wait-interval-seconds "${OKE_DELETE_WAIT_INTERVAL_SECONDS}" \
       --wait-for-state SUCCEEDED \
       --wait-for-state FAILED \
-      --query 'data.status' \
-      --raw-output
-    [[ ${deleteStatus} == "SUCCEEDED" ]] \
-      || die "OKE cluster delete work request for ${clusterOcid} ended in ${deleteStatus:-an unknown state}"
+      || die "${OKE_WORK_REQUEST_ERROR}"
   fi
 }
 
@@ -464,6 +511,7 @@ create_oke() {
         --raw-output
     fi
     [[ -n ${OCI_AD} ]] || die "could not determine an OCI availability domain"
+    SCYLLA_NODE_AD="${SCYLLA_NODE_AD:-${OCI_AD}}"
     printf "Resuming OKE %s (%s) in %s\n" "${OKE_CLUSTER_NAME}" "${K8S_VERSION}" "${OCI_REGION}"
   else
     preflight_create
@@ -484,9 +532,11 @@ create_oke() {
       --raw-output
   fi
   [[ -n ${OCI_AD} ]] || die "could not determine an OCI availability domain"
+  SCYLLA_NODE_AD="${SCYLLA_NODE_AD:-${OCI_AD}}"
 
   printf "Creating OKE %s (%s) in %s\n" "${OKE_CLUSTER_NAME}" "${K8S_VERSION}" "${OCI_REGION}"
-  printf "Using availability domain %s and three fault domains for ScyllaDB\n" "${OCI_AD}"
+  printf "Using availability domain %s for general nodes and %s with three fault domains for ScyllaDB\n" \
+    "${OCI_AD}" "${SCYLLA_NODE_AD}"
 
   capture_oci OKE_VCN_OCID network vcn create \
     --region "${OCI_REGION}" \
@@ -632,7 +682,7 @@ create_oke() {
   [[ -n ${OKE_CP_SUBNET_OCID} && -n ${OKE_WORKERS_SUBNET_OCID} && -n ${OKE_LB_SUBNET_OCID} ]] \
     || die "subnet OCID lookup failed"
 
-  run_oci ce cluster create \
+  run_oke_work_request "OKE cluster create" ce cluster create \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
@@ -647,7 +697,8 @@ create_oke() {
     --max-wait-seconds 1800 \
     --wait-interval-seconds 30 \
     --wait-for-state SUCCEEDED \
-    --wait-for-state FAILED
+    --wait-for-state FAILED \
+    || die "${OKE_WORK_REQUEST_ERROR}"
   lookup_cluster
   [[ -n ${OKE_CLUSTER_OCID} ]] || die "OKE cluster creation completed but its OCID could not be found"
   capture_oci clusterState ce cluster get \
@@ -669,17 +720,20 @@ create_oke() {
   fi
   printf "Validated OKE images for all requested node-pool shapes\n"
 
-  lookup_node_pool_state existingSystemPoolState system
+  lookup_node_pool_state existingSystemPoolState existingSystemPoolOcid system
   if [[ ${existingSystemPoolState} == "ACTIVE" ]]; then
     printf "Reusing ACTIVE system node pool\n"
   elif [[ -n ${existingSystemPoolState} ]]; then
-    die "system node pool already exists in state ${existingSystemPoolState}; resolve or delete that pool before resuming"
+    if ! oke_guard_node_pool_resume system "${existingSystemPoolOcid}" \
+        "${existingSystemPoolState}"; then
+      die "${OKE_NODE_POOL_ERROR:-system node pool cannot be resumed}"
+    fi
   else
     generalShapeArgs=()
     if [[ ${GENERAL_NODE_SHAPE} == *.Flex ]]; then
       generalShapeArgs=(--node-shape-config "{\"ocpus\":${GENERAL_NODE_OCPUS},\"memoryInGBs\":${GENERAL_NODE_MEMORY_GBS}}")
     fi
-    run_oci ce node-pool create \
+    run_oke_work_request "OKE system node-pool create" ce node-pool create \
       --region "${OCI_REGION}" \
       --compartment-id "${OCI_COMPARTMENT_OCID}" \
       --cluster-id "${OKE_CLUSTER_OCID}" \
@@ -696,7 +750,8 @@ create_oke() {
       --max-wait-seconds 1800 \
       --wait-interval-seconds 30 \
       --wait-for-state SUCCEEDED \
-      --wait-for-state FAILED
+      --wait-for-state FAILED \
+      || die "${OKE_WORK_REQUEST_ERROR}"
     require_active_node_pool system
   fi
 
@@ -710,17 +765,22 @@ bash /var/run/oke-init.sh --kubelet-extra-args "--cpu-manager-policy=static"
 EOF
   ) || die "failed to encode the OKE Scylla node cloud-init"
 
-  lookup_node_pool_state existingScyllaPoolState scylla
+  lookup_node_pool_state existingScyllaPoolState existingScyllaPoolOcid scylla
   if [[ ${existingScyllaPoolState} == "ACTIVE" ]]; then
     printf "Reusing ACTIVE scylla node pool\n"
   elif [[ -n ${existingScyllaPoolState} ]]; then
-    die "scylla node pool already exists in state ${existingScyllaPoolState}; resolve or delete that pool before resuming"
+    if ! oke_guard_node_pool_resume scylla "${existingScyllaPoolOcid}" \
+        "${existingScyllaPoolState}"; then
+      die "${OKE_NODE_POOL_ERROR:-scylla node pool cannot be resumed}"
+    fi
   else
+    check_scylla_node_limit
     scyllaShapeArgs=()
     if [[ ${SCYLLA_NODE_SHAPE} == *.Flex ]]; then
       scyllaShapeArgs=(--node-shape-config "{\"ocpus\":${SCYLLA_NODE_OCPUS},\"memoryInGBs\":${SCYLLA_NODE_MEMORY_GBS}}")
     fi
-    run_oci ce node-pool create \
+    SCYLLA_PLACEMENT_CONFIGS=$(build_scylla_placement_configs)
+    run_oke_work_request "OKE scylla node-pool create" ce node-pool create \
       --region "${OCI_REGION}" \
       --compartment-id "${OCI_COMPARTMENT_OCID}" \
       --cluster-id "${OKE_CLUSTER_OCID}" \
@@ -729,7 +789,7 @@ EOF
       --node-shape "${SCYLLA_NODE_SHAPE}" \
       "${scyllaShapeArgs[@]}" \
       --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${SCYLLA_NODE_IMAGE_SELECTED}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
-      --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\",\"faultDomains\":[\"FAULT-DOMAIN-1\",\"FAULT-DOMAIN-2\",\"FAULT-DOMAIN-3\"]}]" \
+      --placement-configs "${SCYLLA_PLACEMENT_CONFIGS}" \
       --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
       --size "${SCYLLA_NODE_COUNT}" \
       --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"scylla"}]' \
@@ -737,22 +797,27 @@ EOF
       --max-wait-seconds 1800 \
       --wait-interval-seconds 30 \
       --wait-for-state SUCCEEDED \
-      --wait-for-state FAILED
+      --wait-for-state FAILED \
+      || die "${OKE_WORK_REQUEST_ERROR}"
     require_active_node_pool scylla
   fi
 
   if [[ ${CREATE_APPLICATION_POOL} == true ]]; then
-    lookup_node_pool_state existingApplicationPoolState application
+    lookup_node_pool_state existingApplicationPoolState \
+      existingApplicationPoolOcid application
     if [[ ${existingApplicationPoolState} == "ACTIVE" ]]; then
       printf "Reusing ACTIVE application node pool\n"
     elif [[ -n ${existingApplicationPoolState} ]]; then
-      die "application node pool already exists in state ${existingApplicationPoolState}; resolve or delete that pool before resuming"
+      if ! oke_guard_node_pool_resume application \
+          "${existingApplicationPoolOcid}" "${existingApplicationPoolState}"; then
+        die "${OKE_NODE_POOL_ERROR:-application node pool cannot be resumed}"
+      fi
     else
       applicationShapeArgs=()
       if [[ ${APPLICATION_NODE_SHAPE} == *.Flex ]]; then
         applicationShapeArgs=(--node-shape-config "{\"ocpus\":${APPLICATION_NODE_OCPUS},\"memoryInGBs\":${APPLICATION_NODE_MEMORY_GBS}}")
       fi
-      run_oci ce node-pool create \
+      run_oke_work_request "OKE application node-pool create" ce node-pool create \
         --region "${OCI_REGION}" \
         --compartment-id "${OCI_COMPARTMENT_OCID}" \
         --cluster-id "${OKE_CLUSTER_OCID}" \
@@ -769,7 +834,8 @@ EOF
         --max-wait-seconds 1800 \
         --wait-interval-seconds 30 \
         --wait-for-state SUCCEEDED \
-        --wait-for-state FAILED
+        --wait-for-state FAILED \
+        || die "${OKE_WORK_REQUEST_ERROR}"
       require_active_node_pool application
     fi
   fi
@@ -842,6 +908,7 @@ OKE_VCN_NAME="${OKE_VCN_NAME:-${OKE_CLUSTER_NAME}-vcn}"
 OKE_KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/config}"
 K8S_VERSION="${K8S_VERSION:-}"
 OCI_AD="${OCI_AD:-}"
+SCYLLA_NODE_AD="${SCYLLA_NODE_AD:-}"
 GENERAL_NODE_SHAPE="${GENERAL_NODE_SHAPE:-VM.Standard.E4.Flex}"
 GENERAL_NODE_OCPUS="${GENERAL_NODE_OCPUS:-4}"
 GENERAL_NODE_MEMORY_GBS="${GENERAL_NODE_MEMORY_GBS:-32}"
@@ -854,6 +921,24 @@ SCYLLA_NODE_MEMORY_GBS="${SCYLLA_NODE_MEMORY_GBS:-128}"
 SCYLLA_NODE_COUNT="${SCYLLA_NODE_COUNT:-3}"
 SCYLLA_NODE_ARCH="${SCYLLA_NODE_ARCH:-X86_64}"
 SCYLLA_NODE_IMAGE_OCID="${SCYLLA_NODE_IMAGE_OCID:-${OKE_NODE_IMAGE_OCID:-}}"
+SCYLLA_NODE_FAULT_DOMAINS_JSON="${SCYLLA_NODE_FAULT_DOMAINS_JSON:-[\"FAULT-DOMAIN-1\",\"FAULT-DOMAIN-2\",\"FAULT-DOMAIN-3\"]}"
+if [[ ${SCYLLA_NODE_LIMIT_NAME+x} != x ]]; then
+  case "${SCYLLA_NODE_SHAPE}" in
+    VM.DenseIO2.*|BM.DenseIO2.*)
+      SCYLLA_NODE_LIMIT_NAME="dense-io2-core-count"
+      ;;
+    *)
+      SCYLLA_NODE_LIMIT_NAME=""
+      ;;
+  esac
+fi
+if [[ ${SCYLLA_NODE_LIMIT_UNITS_PER_NODE+x} != x ]]; then
+  if [[ ${SCYLLA_NODE_SHAPE} == *.Flex ]]; then
+    SCYLLA_NODE_LIMIT_UNITS_PER_NODE="${SCYLLA_NODE_OCPUS}"
+  else
+    SCYLLA_NODE_LIMIT_UNITS_PER_NODE="${SCYLLA_NODE_SHAPE##*.}"
+  fi
+fi
 CREATE_APPLICATION_POOL="${CREATE_APPLICATION_POOL:-false}"
 APPLICATION_NODE_SHAPE="${APPLICATION_NODE_SHAPE:-VM.Standard.E4.Flex}"
 APPLICATION_NODE_OCPUS="${APPLICATION_NODE_OCPUS:-2}"
@@ -893,6 +978,18 @@ validate_positive_integer OKE_DELETE_WAIT_INTERVAL_SECONDS "${OKE_DELETE_WAIT_IN
   || die "SCYLLA_NODE_COUNT must be exactly 3 for the fixed three-rack deployment"
 [[ ${SCYLLA_NODE_SHAPE} == *DenseIO* ]] \
   || die "SCYLLA_NODE_SHAPE must be a DenseIO shape with local NVMe storage"
+if ! jq -e '
+    type == "array"
+    and length == 3
+    and (unique | length) == 3
+    and all(.[]; test("^FAULT-DOMAIN-[1-3]$"))
+  ' <<< "${SCYLLA_NODE_FAULT_DOMAINS_JSON}" > /dev/null; then
+  die "SCYLLA_NODE_FAULT_DOMAINS_JSON must contain each of three distinct OCI fault domains"
+fi
+if [[ -n ${SCYLLA_NODE_LIMIT_NAME} ]]; then
+  validate_positive_integer SCYLLA_NODE_LIMIT_UNITS_PER_NODE \
+    "${SCYLLA_NODE_LIMIT_UNITS_PER_NODE}"
+fi
 if [[ ${GENERAL_NODE_SHAPE} == *.Flex ]]; then
   validate_positive_integer GENERAL_NODE_OCPUS "${GENERAL_NODE_OCPUS}"
   validate_positive_integer GENERAL_NODE_MEMORY_GBS "${GENERAL_NODE_MEMORY_GBS}"

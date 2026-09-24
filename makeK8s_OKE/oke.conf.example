@@ -32,6 +32,18 @@ SCYLLA_NODE_MEMORY_GBS=128
 SCYLLA_NODE_COUNT=3
 SCYLLA_NODE_ARCH="X86_64"
 SCYLLA_NODE_IMAGE_OCID=""
+# Leave empty to use OCI_AD. A separate value allows Scylla placement in
+# another availability domain without moving the general-purpose pool.
+SCYLLA_NODE_AD=""
+# All three distinct fault domains are required; the script rejects a reduced
+# list because the repository deploys one Scylla rack per fault domain.
+SCYLLA_NODE_FAULT_DOMAINS_JSON='["FAULT-DOMAIN-1","FAULT-DOMAIN-2","FAULT-DOMAIN-3"]'
+# The script automatically checks dense-io2-core-count at 8 units per node for
+# VM.DenseIO2.8 and refuses to create a partial pool when fewer than 24 units
+# are available. When choosing another Dense I/O family, set that family's
+# OCI limit name and units consumed per node so the same preflight can run.
+# SCYLLA_NODE_LIMIT_NAME="dense-io2-core-count"
+# SCYLLA_NODE_LIMIT_UNITS_PER_NODE=8
 
 # Optional x86 application pool, matching nodeSelector2=application in init.conf.
 CREATE_APPLICATION_POOL=false

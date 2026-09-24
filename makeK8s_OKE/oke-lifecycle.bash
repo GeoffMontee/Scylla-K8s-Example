@@ -144,6 +144,139 @@ oke_report_records() {
   )
 }
 
+oke_report_work_request() {
+  local workRequestId=$1
+  local errorsJson
+  local logsJson
+
+  printf 'OKE work request FAILED: %s\n' "${workRequestId}" >&2
+  capture_oci errorsJson ce work-request-error list \
+    --work-request-id "${workRequestId}" \
+    --compartment-id "${OCI_COMPARTMENT_OCID}" \
+    --region "${OCI_REGION}" \
+    --all \
+    --output json
+  capture_oci logsJson ce work-request-log-entry list \
+    --work-request-id "${workRequestId}" \
+    --compartment-id "${OCI_COMPARTMENT_OCID}" \
+    --region "${OCI_REGION}" \
+    --all \
+    --output json
+
+  if [[ $(jq -r '(.data // []) | length' <<< "${errorsJson}") -eq 0 ]]; then
+    printf 'OKE work request errors: none returned\n' >&2
+  else
+    jq -r '
+      (.data // [])[]
+      | "OKE work request error [\(.timestamp // "unknown time")] \(.code // "unknown code"): \(.message // "no message")"
+    ' <<< "${errorsJson}" >&2
+  fi
+  if [[ $(jq -r '(.data // []) | length' <<< "${logsJson}") -eq 0 ]]; then
+    printf 'OKE work request logs: none returned\n' >&2
+  else
+    jq -r '
+      (.data // [])[]
+      | "OKE work request log [\(.timestamp // "unknown time")]: \(.message // "no message")"
+    ' <<< "${logsJson}" >&2
+  fi
+}
+
+run_oke_work_request() {
+  local description=$1
+  local output
+  local commandExit
+  local workRequestId=""
+  local workRequestStatus=""
+  shift
+
+  if output=$(oci "$@" --profile "${OCI_CLI_PROFILE}" --output json); then
+    commandExit=0
+  else
+    commandExit=$?
+  fi
+  workRequestId=$(jq -r '.data.id // empty' <<< "${output}" 2>/dev/null) \
+    || workRequestId=""
+  workRequestStatus=$(jq -r '.data.status // empty' <<< "${output}" 2>/dev/null) \
+    || workRequestStatus=""
+
+  if [[ ${workRequestStatus} == "FAILED" ]]; then
+    [[ -n ${workRequestId} ]] && oke_report_work_request "${workRequestId}"
+    OKE_WORK_REQUEST_ERROR="${description} work request ${workRequestId:-unknown} FAILED"
+    return 1
+  fi
+  if [[ ${commandExit} -ne 0 ]]; then
+    OKE_WORK_REQUEST_ERROR="OCI command failed while waiting for ${description}: oci $*"
+    return "${commandExit}"
+  fi
+  if [[ ${workRequestStatus} != "SUCCEEDED" ]]; then
+    OKE_WORK_REQUEST_ERROR="${description} work request ${workRequestId:-unknown} ended in ${workRequestStatus:-an unknown state}"
+    return 1
+  fi
+  printf "%s work request SUCCEEDED: %s\n" \
+    "${description}" "${workRequestId:-unknown}"
+}
+
+oke_latest_node_pool_work_request() {
+  local idVariable=$1
+  local statusVariable=$2
+  local operationVariable=$3
+  local nodePoolOcid=$4
+  local raw
+  local parsedId
+  local parsedStatus
+  local parsedOperation
+
+  capture_oci raw ce work-request list \
+    --compartment-id "${OCI_COMPARTMENT_OCID}" \
+    --cluster-id "${OKE_CLUSTER_OCID}" \
+    --resource-id "${nodePoolOcid}" \
+    --resource-type NODEPOOL \
+    --sort-by TIME_ACCEPTED \
+    --sort-order DESC \
+    --all \
+    --region "${OCI_REGION}" \
+    --output json
+  [[ -n ${raw} ]] || raw='{"data":[]}'
+  parsedId=$(jq -r '.data[0].id // empty' <<< "${raw}") \
+    || return 1
+  parsedStatus=$(jq -r '.data[0].status // empty' <<< "${raw}") \
+    || return 1
+  parsedOperation=$(jq -r '.data[0]."operation-type" // empty' <<< "${raw}") \
+    || return 1
+  printf -v "${idVariable}" '%s' "${parsedId}"
+  printf -v "${statusVariable}" '%s' "${parsedStatus}"
+  printf -v "${operationVariable}" '%s' "${parsedOperation}"
+}
+
+oke_guard_node_pool_resume() {
+  local poolName=$1
+  local nodePoolOcid=$2
+  local nodePoolState=$3
+  local workRequestId=""
+  local workRequestStatus=""
+  local workRequestOperation=""
+
+  OKE_NODE_POOL_ERROR=""
+  if [[ ${nodePoolState} == "ACTIVE" ]]; then
+    return 0
+  fi
+
+  oke_latest_node_pool_work_request workRequestId workRequestStatus \
+    workRequestOperation "${nodePoolOcid}" || return 1
+  if [[ ${workRequestStatus} == "FAILED" ]]; then
+    oke_report_work_request "${workRequestId}" || return 1
+    OKE_NODE_POOL_ERROR="cannot resume: ${poolName} node pool ${nodePoolOcid} reports lifecycle state ${nodePoolState:-missing}, but its latest ${workRequestOperation:-OKE} work request ${workRequestId} FAILED. Resolve the reported cause and wait for OCI to reconcile the pool to ACTIVE before rerunning --resume. To replace it instead, explicitly delete only this failed pool by OCID, wait for that delete work request to succeed, and rerun --resume; this script did not mutate it."
+    return 1
+  fi
+
+  if [[ -n ${workRequestId} ]]; then
+    OKE_NODE_POOL_ERROR="cannot resume: ${poolName} node pool ${nodePoolOcid} is ${nodePoolState:-missing}; latest work request ${workRequestId} is ${workRequestStatus:-unknown}. Wait for it to reach a terminal state, then rerun --resume."
+  else
+    OKE_NODE_POOL_ERROR="cannot resume: ${poolName} node pool ${nodePoolOcid} is ${nodePoolState:-missing}, and OCI returned no associated work request. Inspect or explicitly remove only this pool before rerunning --resume."
+  fi
+  return 1
+}
+
 oke_check_create_collisions() {
   local attempts=${OKE_DISCOVERY_RETRY_ATTEMPTS:-6}
   local delaySeconds=${OKE_DISCOVERY_RETRY_DELAY_SECONDS:-10}

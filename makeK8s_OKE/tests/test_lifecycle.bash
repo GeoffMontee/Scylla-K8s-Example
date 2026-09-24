@@ -8,9 +8,14 @@ source "${scriptDir}/oke-lifecycle.bash"
 
 OKE_CLUSTER_NAME=scylladb-demo
 OKE_VCN_NAME=scylladb-demo-vcn
+OKE_CLUSTER_OCID=cluster-live
+OCI_COMPARTMENT_OCID=compartment-live
+OCI_REGION=us-test-1
+OCI_CLI_PROFILE=DEFAULT
 OKE_DISCOVERY_RETRY_ATTEMPTS=3
 OKE_DISCOVERY_RETRY_DELAY_SECONDS=1
 SCENARIO=""
+WORK_REQUEST_STATUS=FAILED
 
 sleep() {
   :
@@ -70,6 +75,50 @@ list_oke_vcn_records() {
       printf '[]\n'
       ;;
   esac
+}
+
+capture_oci() {
+  local variableName=$1
+  local commandText
+  local value
+  shift
+  commandText="$*"
+  case "${commandText}" in
+    "ce work-request list "*)
+      value=$(jq -cn --arg status "${WORK_REQUEST_STATUS}" '{
+        data:[{
+          id:"work-request-failed",
+          status:$status,
+          "operation-type":"NODEPOOL_RECONCILE"
+        }]
+      }')
+      ;;
+    "ce work-request-error list "*)
+      [[ ${commandText} == *"--compartment-id compartment-live"* ]] \
+        || return 98
+      value='{"data":[{
+        "code":"LimitExceeded",
+        "message":"dense-io2-core-count exhausted",
+        "timestamp":"2026-09-24T16:20:42+00:00"
+      }]}'
+      ;;
+    "ce work-request-log-entry list "*)
+      value='{"data":[{
+        "message":"2 node(s) launch failure",
+        "timestamp":"2026-09-24T16:20:42.509Z"
+      }]}'
+      ;;
+    *)
+      printf 'unexpected mocked OCI command: %s\n' "${commandText}" >&2
+      return 99
+      ;;
+  esac
+  printf -v "${variableName}" '%s' "${value}"
+}
+
+oci() {
+  printf '%s\n' \
+    '{"data":{"id":"work-request-failed","status":"FAILED"}}'
 }
 
 assert_contains() {
@@ -170,6 +219,78 @@ test_teardown_verification_rejects_live_owned_parent() {
   assert_contains "${output}" "cluster-active"
 }
 
+test_failed_work_request_diagnostics() {
+  local output
+  output=$(oke_report_work_request work-request-failed 2>&1)
+  assert_contains "${output}" "OKE work request FAILED: work-request-failed"
+  assert_contains "${output}" "LimitExceeded: dense-io2-core-count exhausted"
+  assert_contains "${output}" "2 node(s) launch failure"
+}
+
+test_waited_failed_work_request_reports_diagnostics() {
+  local output
+  if output=$({
+    if run_oke_work_request "OKE scylla node-pool create" \
+        ce node-pool create --wait-for-state FAILED; then
+      rc=0
+    else
+      rc=$?
+    fi
+    printf '%s\n' "${OKE_WORK_REQUEST_ERROR}"
+    exit "${rc}"
+  } 2>&1); then
+    printf 'failed waited work request unexpectedly passed\n' >&2
+    return 1
+  fi
+  assert_contains "${output}" "OKE work request FAILED: work-request-failed"
+  assert_contains "${output}" "LimitExceeded: dense-io2-core-count exhausted"
+  assert_contains "${output}" "OKE scylla node-pool create work request work-request-failed FAILED"
+}
+
+test_failed_pool_resume_rejects_stale_creating_state() {
+  local output
+  WORK_REQUEST_STATUS=FAILED
+  if output=$({
+    if oke_guard_node_pool_resume scylla pool-failed CREATING; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ ${rc} -ne 0 ]]; then
+      printf '%s\n' "${OKE_NODE_POOL_ERROR}"
+    fi
+    exit "${rc}"
+  } 2>&1); then
+    printf 'failed node pool unexpectedly resumed\n' >&2
+    return 1
+  fi
+  assert_contains "${output}" "dense-io2-core-count exhausted"
+  assert_contains "${output}" "reports lifecycle state CREATING"
+  assert_contains "${output}" "work-request-failed FAILED"
+  assert_contains "${output}" "explicitly delete only this failed pool"
+}
+
+test_in_progress_pool_resume_requires_wait() {
+  local output
+  WORK_REQUEST_STATUS=IN_PROGRESS
+  if output=$({
+    if oke_guard_node_pool_resume scylla pool-progress CREATING; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ ${rc} -ne 0 ]]; then
+      printf '%s\n' "${OKE_NODE_POOL_ERROR}"
+    fi
+    exit "${rc}"
+  } 2>&1); then
+    printf 'in-progress node pool unexpectedly resumed\n' >&2
+    return 1
+  fi
+  assert_contains "${output}" "latest work request work-request-failed is IN_PROGRESS"
+  [[ ${output} != *"dense-io2-core-count exhausted"* ]]
+}
+
 test_active_owned_collision
 test_active_unowned_collision
 test_terminal_stale_records
@@ -177,4 +298,8 @@ test_eventual_consistency_disappearance
 test_valid_partial_resume
 test_fully_deleted_deployment_is_not_resumable
 test_teardown_verification_rejects_live_owned_parent
+test_failed_work_request_diagnostics
+test_waited_failed_work_request_reports_diagnostics
+test_failed_pool_resume_rejects_stale_creating_state
+test_in_progress_pool_resume_requires_wait
 printf 'OKE lifecycle tests passed\n'
