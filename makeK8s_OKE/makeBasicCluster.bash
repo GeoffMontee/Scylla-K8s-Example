@@ -41,6 +41,10 @@ capture_oci() {
   printf -v "${variableName}" '%s' "${value}"
 }
 
+# shellcheck source=oke-image-selection.bash
+source "${scriptDir}/oke-image-selection.bash" \
+  || die "could not load OKE image-selection helpers"
+
 run_kubectl() {
   if ! kubectl "$@"; then
     die "kubectl command failed: kubectl $*"
@@ -99,6 +103,18 @@ require_active_node_pool() {
     --raw-output
   [[ ${poolState} == "ACTIVE" ]] \
     || die "OKE node pool ${poolName} did not become ACTIVE (state: ${poolState:-missing})"
+}
+
+lookup_node_pool_state() {
+  local outputVariable=$1
+  local poolName=$2
+  capture_oci "${outputVariable}" ce node-pool list \
+    --region "${OCI_REGION}" \
+    --compartment-id "${OCI_COMPARTMENT_OCID}" \
+    --cluster-id "${OKE_CLUSTER_OCID}" \
+    --all \
+    --query "data[?name=='${poolName}'] | [0].\"lifecycle-state\"" \
+    --raw-output
 }
 
 lookup_network() {
@@ -251,22 +267,54 @@ delete_oke() {
 
 create_oke() {
   targetContext="${OKE_CLUSTER_NAME}-oke"
-  if kubectl config get-contexts -o name 2>/dev/null | grep -Fxq "${targetContext}"; then
-    die "kubeconfig context ${targetContext} already exists; remove it or choose another OKE_CLUSTER_NAME"
-  fi
-
-  lookup_name_collisions
-  if [[ -n ${existingCluster} || -n ${existingVcn} ]]; then
-    die "resources named ${OKE_CLUSTER_NAME} already exist; use -d before recreating them"
-  fi
-
-  if [[ -z ${K8S_VERSION} ]]; then
-    capture_oci K8S_VERSION ce cluster-options get \
-      --cluster-option-id all \
+  if [[ ${RESUME_EXISTING} == true ]]; then
+    lookup_cluster
+    [[ -n ${OKE_CLUSTER_OCID} ]] \
+      || die "cannot resume: tagged OKE cluster ${OKE_CLUSTER_NAME} was not found"
+    lookup_network
+    [[ -n ${OKE_VCN_OCID} && -n ${OKE_CP_SUBNET_OCID} && -n ${OKE_WORKERS_SUBNET_OCID} && -n ${OKE_LB_SUBNET_OCID} ]] \
+      || die "cannot resume: one or more tagged OKE network resources could not be found"
+    capture_oci existingK8sVersion ce cluster get \
+      --cluster-id "${OKE_CLUSTER_OCID}" \
       --region "${OCI_REGION}" \
-      --query 'data."kubernetes-versions" | sort(@) | [-1]' \
+      --query 'data."kubernetes-version"' \
       --raw-output
-  fi
+    if [[ -n ${K8S_VERSION} && ${K8S_VERSION} != "${existingK8sVersion}" ]]; then
+      die "cannot resume: configured K8S_VERSION ${K8S_VERSION} differs from cluster version ${existingK8sVersion}"
+    fi
+    K8S_VERSION="${existingK8sVersion}"
+    capture_oci clusterState ce cluster get \
+      --cluster-id "${OKE_CLUSTER_OCID}" \
+      --region "${OCI_REGION}" \
+      --query 'data."lifecycle-state"' \
+      --raw-output
+    [[ ${clusterState} == "ACTIVE" ]] \
+      || die "cannot resume: OKE cluster is not ACTIVE (state: ${clusterState:-missing})"
+    if [[ -z ${OCI_AD} ]]; then
+      capture_oci OCI_AD iam availability-domain list \
+        --region "${OCI_REGION}" \
+        --compartment-id "${OCI_COMPARTMENT_OCID}" \
+        --query 'data[0].name' \
+        --raw-output
+    fi
+    [[ -n ${OCI_AD} ]] || die "could not determine an OCI availability domain"
+    printf "Resuming OKE %s (%s) in %s\n" "${OKE_CLUSTER_NAME}" "${K8S_VERSION}" "${OCI_REGION}"
+  else
+    if kubectl config get-contexts -o name 2>/dev/null | grep -Fxq "${targetContext}"; then
+      die "kubeconfig context ${targetContext} already exists; remove it or choose another OKE_CLUSTER_NAME"
+    fi
+
+    lookup_name_collisions
+    if [[ -n ${existingCluster} || -n ${existingVcn} ]]; then
+      die "resources named ${OKE_CLUSTER_NAME} already exist; use --resume for a tagged partial deployment, or -d before recreating it"
+    fi
+    if [[ -z ${K8S_VERSION} ]]; then
+      capture_oci K8S_VERSION ce cluster-options get \
+        --cluster-option-id all \
+        --region "${OCI_REGION}" \
+        --query 'data."kubernetes-versions" | sort(@) | [-1]' \
+        --raw-output
+    fi
   [[ -n ${K8S_VERSION} ]] || die "could not determine a supported OKE Kubernetes version"
 
   if [[ -z ${OCI_AD} ]]; then
@@ -441,39 +489,48 @@ create_oke() {
     --raw-output
   [[ ${clusterState} == "ACTIVE" ]] \
     || die "OKE cluster did not become ACTIVE (state: ${clusterState:-missing})"
-
-  K8S_VERSION_BARE="${K8S_VERSION#v}"
-  OKE_IMAGE_QUERY=$(printf 'max_by(data.sources[?contains("source-name",`Oracle-Linux-8.`) && contains("source-name",`-OKE-%s-`) && !contains("source-name",`aarch64`) && !contains("source-name",`GPU`)], &"source-name")."image-id"' "${K8S_VERSION_BARE}")
-  capture_oci OKE_NODE_IMAGE_OCID ce node-pool-options get \
-    --node-pool-option-id "${OKE_CLUSTER_OCID}" \
-    --region "${OCI_REGION}" \
-    --query "${OKE_IMAGE_QUERY}" \
-    --raw-output
-  [[ -n ${OKE_NODE_IMAGE_OCID} ]] || die "no Oracle Linux 8 OKE image matched ${K8S_VERSION}"
-
-  generalShapeArgs=()
-  if [[ ${GENERAL_NODE_SHAPE} == *.Flex ]]; then
-    generalShapeArgs=(--node-shape-config "{\"ocpus\":${GENERAL_NODE_OCPUS},\"memoryInGBs\":${GENERAL_NODE_MEMORY_GBS}}")
   fi
-  run_oci ce node-pool create \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --cluster-id "${OKE_CLUSTER_OCID}" \
-    --name system \
-    --kubernetes-version "${K8S_VERSION}" \
-    --node-shape "${GENERAL_NODE_SHAPE}" \
-    "${generalShapeArgs[@]}" \
-    --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${OKE_NODE_IMAGE_OCID}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
-    --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\"}]" \
-    --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
-    --size "${GENERAL_NODE_COUNT}" \
-    --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"scylla-operator"}]' \
-    --node-metadata '{"areLegacyImdsEndpointsDisabled":"true"}' \
-    --max-wait-seconds 1800 \
-    --wait-interval-seconds 30 \
-    --wait-for-state SUCCEEDED \
-    --wait-for-state FAILED
-  require_active_node_pool system
+
+  select_oke_node_image GENERAL_NODE_IMAGE_SELECTED system \
+    "${GENERAL_NODE_SHAPE}" "${GENERAL_NODE_ARCH}" "${GENERAL_NODE_IMAGE_OCID}"
+  select_oke_node_image SCYLLA_NODE_IMAGE_SELECTED scylla \
+    "${SCYLLA_NODE_SHAPE}" "${SCYLLA_NODE_ARCH}" "${SCYLLA_NODE_IMAGE_OCID}"
+  if [[ ${CREATE_APPLICATION_POOL} == true ]]; then
+    select_oke_node_image APPLICATION_NODE_IMAGE_SELECTED application \
+      "${APPLICATION_NODE_SHAPE}" "${APPLICATION_NODE_ARCH}" "${APPLICATION_NODE_IMAGE_OCID}"
+  fi
+  printf "Validated OKE images for all requested node-pool shapes\n"
+
+  lookup_node_pool_state existingSystemPoolState system
+  if [[ ${existingSystemPoolState} == "ACTIVE" ]]; then
+    printf "Reusing ACTIVE system node pool\n"
+  elif [[ -n ${existingSystemPoolState} ]]; then
+    die "system node pool already exists in state ${existingSystemPoolState}; resolve or delete that pool before resuming"
+  else
+    generalShapeArgs=()
+    if [[ ${GENERAL_NODE_SHAPE} == *.Flex ]]; then
+      generalShapeArgs=(--node-shape-config "{\"ocpus\":${GENERAL_NODE_OCPUS},\"memoryInGBs\":${GENERAL_NODE_MEMORY_GBS}}")
+    fi
+    run_oci ce node-pool create \
+      --region "${OCI_REGION}" \
+      --compartment-id "${OCI_COMPARTMENT_OCID}" \
+      --cluster-id "${OKE_CLUSTER_OCID}" \
+      --name system \
+      --kubernetes-version "${K8S_VERSION}" \
+      --node-shape "${GENERAL_NODE_SHAPE}" \
+      "${generalShapeArgs[@]}" \
+      --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${GENERAL_NODE_IMAGE_SELECTED}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
+      --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\"}]" \
+      --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
+      --size "${GENERAL_NODE_COUNT}" \
+      --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"scylla-operator"}]' \
+      --node-metadata '{"areLegacyImdsEndpointsDisabled":"true"}' \
+      --max-wait-seconds 1800 \
+      --wait-interval-seconds 30 \
+      --wait-for-state SUCCEEDED \
+      --wait-for-state FAILED
+    require_active_node_pool system
+  fi
 
   CLOUD_INIT_BASE64=$(base64 <<'EOF' | tr -d '\n'
 #!/bin/bash
@@ -485,72 +542,92 @@ bash /var/run/oke-init.sh --kubelet-extra-args "--cpu-manager-policy=static"
 EOF
   ) || die "failed to encode the OKE Scylla node cloud-init"
 
-  scyllaShapeArgs=()
-  if [[ ${SCYLLA_NODE_SHAPE} == *.Flex ]]; then
-    scyllaShapeArgs=(--node-shape-config "{\"ocpus\":${SCYLLA_NODE_OCPUS},\"memoryInGBs\":${SCYLLA_NODE_MEMORY_GBS}}")
-  fi
-  run_oci ce node-pool create \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --cluster-id "${OKE_CLUSTER_OCID}" \
-    --name scylla \
-    --kubernetes-version "${K8S_VERSION}" \
-    --node-shape "${SCYLLA_NODE_SHAPE}" \
-    "${scyllaShapeArgs[@]}" \
-    --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${OKE_NODE_IMAGE_OCID}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
-    --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\",\"faultDomains\":[\"FAULT-DOMAIN-1\",\"FAULT-DOMAIN-2\",\"FAULT-DOMAIN-3\"]}]" \
-    --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
-    --size "${SCYLLA_NODE_COUNT}" \
-    --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"scylla"}]' \
-    --node-metadata "{\"user_data\":\"${CLOUD_INIT_BASE64}\",\"areLegacyImdsEndpointsDisabled\":\"true\"}" \
-    --max-wait-seconds 1800 \
-    --wait-interval-seconds 30 \
-    --wait-for-state SUCCEEDED \
-    --wait-for-state FAILED
-  require_active_node_pool scylla
-
-  if [[ ${CREATE_APPLICATION_POOL} == true ]]; then
-    applicationShapeArgs=()
-    if [[ ${APPLICATION_NODE_SHAPE} == *.Flex ]]; then
-      applicationShapeArgs=(--node-shape-config "{\"ocpus\":${APPLICATION_NODE_OCPUS},\"memoryInGBs\":${APPLICATION_NODE_MEMORY_GBS}}")
+  lookup_node_pool_state existingScyllaPoolState scylla
+  if [[ ${existingScyllaPoolState} == "ACTIVE" ]]; then
+    printf "Reusing ACTIVE scylla node pool\n"
+  elif [[ -n ${existingScyllaPoolState} ]]; then
+    die "scylla node pool already exists in state ${existingScyllaPoolState}; resolve or delete that pool before resuming"
+  else
+    scyllaShapeArgs=()
+    if [[ ${SCYLLA_NODE_SHAPE} == *.Flex ]]; then
+      scyllaShapeArgs=(--node-shape-config "{\"ocpus\":${SCYLLA_NODE_OCPUS},\"memoryInGBs\":${SCYLLA_NODE_MEMORY_GBS}}")
     fi
     run_oci ce node-pool create \
       --region "${OCI_REGION}" \
       --compartment-id "${OCI_COMPARTMENT_OCID}" \
       --cluster-id "${OKE_CLUSTER_OCID}" \
-      --name application \
+      --name scylla \
       --kubernetes-version "${K8S_VERSION}" \
-      --node-shape "${APPLICATION_NODE_SHAPE}" \
-      "${applicationShapeArgs[@]}" \
-      --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${OKE_NODE_IMAGE_OCID}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
-      --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\"}]" \
+      --node-shape "${SCYLLA_NODE_SHAPE}" \
+      "${scyllaShapeArgs[@]}" \
+      --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${SCYLLA_NODE_IMAGE_SELECTED}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
+      --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\",\"faultDomains\":[\"FAULT-DOMAIN-1\",\"FAULT-DOMAIN-2\",\"FAULT-DOMAIN-3\"]}]" \
       --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
-      --size "${APPLICATION_NODE_COUNT}" \
-      --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"application"}]' \
-      --node-metadata '{"areLegacyImdsEndpointsDisabled":"true"}' \
+      --size "${SCYLLA_NODE_COUNT}" \
+      --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"scylla"}]' \
+      --node-metadata "{\"user_data\":\"${CLOUD_INIT_BASE64}\",\"areLegacyImdsEndpointsDisabled\":\"true\"}" \
       --max-wait-seconds 1800 \
       --wait-interval-seconds 30 \
       --wait-for-state SUCCEEDED \
       --wait-for-state FAILED
-    require_active_node_pool application
+    require_active_node_pool scylla
   fi
 
-  mkdir -p "$(dirname "${OKE_KUBECONFIG_FILE}")" \
-    || die "could not create the kubeconfig directory"
-  run_oci ce cluster create-kubeconfig \
-    --region "${OCI_REGION}" \
-    --cluster-id "${OKE_CLUSTER_OCID}" \
-    --file "${OKE_KUBECONFIG_FILE}" \
-    --token-version 2.0.0 \
-    --kube-endpoint PUBLIC_ENDPOINT \
-    --with-auth-context
-
-  generatedContext=$(kubectl config current-context 2>/dev/null) \
-    || die "OCI created kubeconfig, but kubectl has no current context"
-  if [[ ${generatedContext} != "${targetContext}" ]]; then
-    run_kubectl config rename-context "${generatedContext}" "${targetContext}"
+  if [[ ${CREATE_APPLICATION_POOL} == true ]]; then
+    lookup_node_pool_state existingApplicationPoolState application
+    if [[ ${existingApplicationPoolState} == "ACTIVE" ]]; then
+      printf "Reusing ACTIVE application node pool\n"
+    elif [[ -n ${existingApplicationPoolState} ]]; then
+      die "application node pool already exists in state ${existingApplicationPoolState}; resolve or delete that pool before resuming"
+    else
+      applicationShapeArgs=()
+      if [[ ${APPLICATION_NODE_SHAPE} == *.Flex ]]; then
+        applicationShapeArgs=(--node-shape-config "{\"ocpus\":${APPLICATION_NODE_OCPUS},\"memoryInGBs\":${APPLICATION_NODE_MEMORY_GBS}}")
+      fi
+      run_oci ce node-pool create \
+        --region "${OCI_REGION}" \
+        --compartment-id "${OCI_COMPARTMENT_OCID}" \
+        --cluster-id "${OKE_CLUSTER_OCID}" \
+        --name application \
+        --kubernetes-version "${K8S_VERSION}" \
+        --node-shape "${APPLICATION_NODE_SHAPE}" \
+        "${applicationShapeArgs[@]}" \
+        --node-source-details "{\"sourceType\":\"IMAGE\",\"imageId\":\"${APPLICATION_NODE_IMAGE_SELECTED}\",\"bootVolumeSizeInGBs\":${NODE_BOOT_VOLUME_GBS}}" \
+        --placement-configs "[{\"availabilityDomain\":\"${OCI_AD}\",\"subnetId\":\"${OKE_WORKERS_SUBNET_OCID}\"}]" \
+        --pod-subnet-ids "[\"${OKE_WORKERS_SUBNET_OCID}\"]" \
+        --size "${APPLICATION_NODE_COUNT}" \
+        --initial-node-labels '[{"key":"scylla.scylladb.com/node-type","value":"application"}]' \
+        --node-metadata '{"areLegacyImdsEndpointsDisabled":"true"}' \
+        --max-wait-seconds 1800 \
+        --wait-interval-seconds 30 \
+        --wait-for-state SUCCEEDED \
+        --wait-for-state FAILED
+      require_active_node_pool application
+    fi
   fi
-  run_kubectl config use-context "${targetContext}"
+
+  if kubectl config get-contexts -o name 2>/dev/null | grep -Fxq "${targetContext}"; then
+    [[ ${RESUME_EXISTING} == true ]] \
+      || die "kubeconfig context ${targetContext} already exists"
+    run_kubectl config use-context "${targetContext}"
+  else
+    mkdir -p "$(dirname "${OKE_KUBECONFIG_FILE}")" \
+      || die "could not create the kubeconfig directory"
+    run_oci ce cluster create-kubeconfig \
+      --region "${OCI_REGION}" \
+      --cluster-id "${OKE_CLUSTER_OCID}" \
+      --file "${OKE_KUBECONFIG_FILE}" \
+      --token-version 2.0.0 \
+      --kube-endpoint PUBLIC_ENDPOINT \
+      --with-auth-context
+
+    generatedContext=$(kubectl config current-context 2>/dev/null) \
+      || die "OCI created kubeconfig, but kubectl has no current context"
+    if [[ ${generatedContext} != "${targetContext}" ]]; then
+      run_kubectl config rename-context "${generatedContext}" "${targetContext}"
+    fi
+    run_kubectl config use-context "${targetContext}"
+  fi
   run_kubectl wait --for=condition=Ready nodes --all --timeout=20m
   run_kubectl taint nodes -l scylla.scylladb.com/node-type=scylla \
     scylla-operator.scylladb.com/dedicated=scyllaclusters:NoSchedule --overwrite
@@ -601,15 +678,21 @@ GENERAL_NODE_SHAPE="${GENERAL_NODE_SHAPE:-VM.Standard.E4.Flex}"
 GENERAL_NODE_OCPUS="${GENERAL_NODE_OCPUS:-4}"
 GENERAL_NODE_MEMORY_GBS="${GENERAL_NODE_MEMORY_GBS:-32}"
 GENERAL_NODE_COUNT="${GENERAL_NODE_COUNT:-1}"
-SCYLLA_NODE_SHAPE="${SCYLLA_NODE_SHAPE:-VM.DenseIO.E4.Flex}"
+GENERAL_NODE_ARCH="${GENERAL_NODE_ARCH:-X86_64}"
+GENERAL_NODE_IMAGE_OCID="${GENERAL_NODE_IMAGE_OCID:-${OKE_NODE_IMAGE_OCID:-}}"
+SCYLLA_NODE_SHAPE="${SCYLLA_NODE_SHAPE:-VM.DenseIO2.8}"
 SCYLLA_NODE_OCPUS="${SCYLLA_NODE_OCPUS:-8}"
 SCYLLA_NODE_MEMORY_GBS="${SCYLLA_NODE_MEMORY_GBS:-128}"
 SCYLLA_NODE_COUNT="${SCYLLA_NODE_COUNT:-3}"
+SCYLLA_NODE_ARCH="${SCYLLA_NODE_ARCH:-X86_64}"
+SCYLLA_NODE_IMAGE_OCID="${SCYLLA_NODE_IMAGE_OCID:-${OKE_NODE_IMAGE_OCID:-}}"
 CREATE_APPLICATION_POOL="${CREATE_APPLICATION_POOL:-false}"
 APPLICATION_NODE_SHAPE="${APPLICATION_NODE_SHAPE:-VM.Standard.E4.Flex}"
 APPLICATION_NODE_OCPUS="${APPLICATION_NODE_OCPUS:-2}"
 APPLICATION_NODE_MEMORY_GBS="${APPLICATION_NODE_MEMORY_GBS:-16}"
 APPLICATION_NODE_COUNT="${APPLICATION_NODE_COUNT:-1}"
+APPLICATION_NODE_ARCH="${APPLICATION_NODE_ARCH:-X86_64}"
+APPLICATION_NODE_IMAGE_OCID="${APPLICATION_NODE_IMAGE_OCID:-${OKE_NODE_IMAGE_OCID:-}}"
 NODE_BOOT_VOLUME_GBS="${NODE_BOOT_VOLUME_GBS:-100}"
 VCN_CIDR="${VCN_CIDR:-10.0.0.0/16}"
 CONTROL_PLANE_SUBNET_CIDR="${CONTROL_PLANE_SUBNET_CIDR:-10.0.0.0/24}"
@@ -662,14 +745,19 @@ if ! oci iam region list --profile "${OCI_CLI_PROFILE}" > /dev/null 2>&1; then
   die "OCI CLI profile ${OCI_CLI_PROFILE} is not authenticated; run 'oci setup config'"
 fi
 
+RESUME_EXISTING=false
 case "${1:-}" in
   "")
+    create_oke
+    ;;
+  -r|--resume)
+    RESUME_EXISTING=true
     create_oke
     ;;
   -d|-x)
     delete_oke
     ;;
   *)
-    die "usage: ${BASH_SOURCE[0]##*/} [-d|-x]"
+    die "usage: ${BASH_SOURCE[0]##*/} [--resume|-r|-d|-x]"
     ;;
 esac

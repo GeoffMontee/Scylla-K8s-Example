@@ -62,6 +62,8 @@ encryption_keys/
 # Project-specific
 NU
 test*
+!makeK8s_OKE/tests/
+!makeK8s_OKE/tests/test_image_selection.bash
 *dc1*
 my*
 docker-compose*

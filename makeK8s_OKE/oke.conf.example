@@ -17,14 +17,21 @@ GENERAL_NODE_SHAPE="VM.Standard.E4.Flex"
 GENERAL_NODE_OCPUS=4
 GENERAL_NODE_MEMORY_GBS=32
 GENERAL_NODE_COUNT=1
+GENERAL_NODE_ARCH="X86_64"
+# Optional OKE image OCID override. Empty selects the newest non-GPU OL8 image
+# returned for this Kubernetes version/architecture and validates the shape.
+GENERAL_NODE_IMAGE_OCID=""
 
 # Dedicated ScyllaDB pool. Dense I/O shapes provide the local NVMe devices
-# consumed by local-csi-driver/nodeconfigOKE.yaml.
-SCYLLA_NODE_SHAPE="VM.DenseIO.E4.Flex"
+# consumed by local-csi-driver/nodeconfigOKE.yaml. VM.DenseIO2.8 is a fixed
+# x86 shape; the OCPU/memory values below are ignored for non-Flex shapes.
+SCYLLA_NODE_SHAPE="VM.DenseIO2.8"
 SCYLLA_NODE_OCPUS=8
 SCYLLA_NODE_MEMORY_GBS=128
 # The repository deploys three one-member racks, one per OCI fault domain.
 SCYLLA_NODE_COUNT=3
+SCYLLA_NODE_ARCH="X86_64"
+SCYLLA_NODE_IMAGE_OCID=""
 
 # Optional x86 application pool, matching nodeSelector2=application in init.conf.
 CREATE_APPLICATION_POOL=false
@@ -32,6 +39,8 @@ APPLICATION_NODE_SHAPE="VM.Standard.E4.Flex"
 APPLICATION_NODE_OCPUS=2
 APPLICATION_NODE_MEMORY_GBS=16
 APPLICATION_NODE_COUNT=1
+APPLICATION_NODE_ARCH="X86_64"
+APPLICATION_NODE_IMAGE_OCID=""
 
 NODE_BOOT_VOLUME_GBS=100
 
