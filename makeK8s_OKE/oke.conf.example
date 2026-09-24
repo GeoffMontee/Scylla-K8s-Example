@@ -54,3 +54,10 @@ LOAD_BALANCER_SUBNET_CIDR="10.0.2.0/24"
 # Public API and load-balancer ingress. Restrict these CIDRs for production.
 API_INGRESS_CIDR="0.0.0.0/0"
 LOAD_BALANCER_INGRESS_CIDR="0.0.0.0/0"
+
+# Optional lifecycle wait tuning. The defaults retry OCI discovery 6 times at
+# 10-second intervals and allow delete operations up to 30 minutes.
+# OKE_DISCOVERY_RETRY_ATTEMPTS=6
+# OKE_DISCOVERY_RETRY_DELAY_SECONDS=10
+# OKE_DELETE_MAX_WAIT_SECONDS=1800
+# OKE_DELETE_WAIT_INTERVAL_SECONDS=30

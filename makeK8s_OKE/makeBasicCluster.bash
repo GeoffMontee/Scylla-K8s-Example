@@ -7,6 +7,7 @@
 #   cp makeK8s_OKE/oke.conf.example makeK8s_OKE/oke.conf
 #   $EDITOR makeK8s_OKE/oke.conf
 #   ./makeK8s_OKE/makeBasicCluster.bash
+#   ./makeK8s_OKE/makeBasicCluster.bash --preflight
 #   ./makeK8s_OKE/makeBasicCluster.bash -d
 
 set -o pipefail
@@ -44,6 +45,9 @@ capture_oci() {
 # shellcheck source=oke-image-selection.bash
 source "${scriptDir}/oke-image-selection.bash" \
   || die "could not load OKE image-selection helpers"
+# shellcheck source=oke-lifecycle.bash
+source "${scriptDir}/oke-lifecycle.bash" \
+  || die "could not load OKE lifecycle helpers"
 
 run_kubectl() {
   if ! kubectl "$@"; then
@@ -66,41 +70,36 @@ delete_context() {
 }
 
 lookup_cluster() {
-  capture_oci OKE_CLUSTER_OCID ce cluster list \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --name "${OKE_CLUSTER_NAME}" \
-    --all \
-    --query "data[?\"freeform-tags\".scylla_k8s_example_oke=='${OKE_CLUSTER_NAME}'] | [0].id" \
-    --raw-output
+  local records
+  local liveRecords
+  local ownedRecords
+  records=$(list_oke_cluster_records) || die "could not list OKE clusters"
+  liveRecords=$(oke_live_records "${records}") \
+    || die "could not classify OKE cluster lifecycle states"
+  ownedRecords=$(oke_owned_records "${liveRecords}") \
+    || die "could not classify OKE cluster ownership"
+  if [[ $(oke_record_count "${ownedRecords}") -gt 1 ]]; then
+    oke_report_records "Ambiguous tagged OKE cluster" "${ownedRecords}"
+    die "multiple live tagged OKE clusters were found"
+  fi
+  OKE_CLUSTER_OCID=$(jq -r '.[0].id // empty' <<< "${ownedRecords}")
+  OKE_CLUSTER_STATE=$(jq -r '.[0].state // empty' <<< "${ownedRecords}")
 }
 
-lookup_name_collisions() {
-  capture_oci existingCluster ce cluster list \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --name "${OKE_CLUSTER_NAME}" \
-    --all \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci existingVcn network vcn list \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --display-name "${OKE_VCN_NAME}" \
-    --all \
-    --query 'data[0].id' \
-    --raw-output
+preflight_create() {
+  local targetContext="${OKE_CLUSTER_NAME}-oke"
+  if kubectl config get-contexts -o name 2>/dev/null | grep -Fxq "${targetContext}"; then
+    die "kubeconfig context ${targetContext} already exists; remove it or choose another OKE_CLUSTER_NAME"
+  fi
+  if ! oke_check_create_collisions; then
+    die "${OKE_LIFECYCLE_ERROR:-could not complete OCI create preflight}"
+  fi
 }
 
 require_active_node_pool() {
   local poolName=$1
   local poolState
-  capture_oci poolState ce node-pool list \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --cluster-id "${OKE_CLUSTER_OCID}" \
-    --query "data[?name=='${poolName}'] | [0].\"lifecycle-state\"" \
-    --raw-output
+  lookup_node_pool_state poolState "${poolName}"
   [[ ${poolState} == "ACTIVE" ]] \
     || die "OKE node pool ${poolName} did not become ACTIVE (state: ${poolState:-missing})"
 }
@@ -108,172 +107,339 @@ require_active_node_pool() {
 lookup_node_pool_state() {
   local outputVariable=$1
   local poolName=$2
-  capture_oci "${outputVariable}" ce node-pool list \
+  local raw
+  local matching
+  local liveMatching
+  capture_oci raw ce node-pool list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --cluster-id "${OKE_CLUSTER_OCID}" \
     --all \
-    --query "data[?name=='${poolName}'] | [0].\"lifecycle-state\"" \
-    --raw-output
+    --output json
+  [[ -n ${raw} ]] || raw='{"data":[]}'
+  matching=$(jq -c --arg name "${poolName}" \
+    '[(.data // [])[] | select(.name == $name)]' <<< "${raw}") \
+    || die "could not parse OKE node-pool discovery"
+  liveMatching=$(jq -c '
+    [.[] | select((."lifecycle-state" | ascii_upcase) != "DELETED"
+      and (."lifecycle-state" | ascii_upcase) != "TERMINATED")]
+  ' <<< "${matching}") || die "could not classify OKE node-pool lifecycle states"
+  if [[ $(jq -r 'length' <<< "${liveMatching}") -gt 1 ]]; then
+    jq -r '.[] | "node pool name=\(.name) ocid=\(.id) state=\(."lifecycle-state")"' \
+      <<< "${liveMatching}" >&2
+    die "multiple live OKE node pools named ${poolName} were found"
+  fi
+  printf -v "${outputVariable}" '%s' \
+    "$(jq -r '.[0]."lifecycle-state" // empty' <<< "${liveMatching}")"
 }
 
-lookup_network() {
-  capture_oci OKE_VCN_OCID network vcn list \
-    --region "${OCI_REGION}" \
-    --compartment-id "${OCI_COMPARTMENT_OCID}" \
-    --display-name "${OKE_VCN_NAME}" \
-    --all \
-    --query "data[?\"freeform-tags\".scylla_k8s_example_oke=='${OKE_CLUSTER_NAME}'] | [0].id" \
-    --raw-output
+lookup_named_network_resource() {
+  local ocidVariable=$1
+  local stateVariable=$2
+  local resourceType=$3
+  local displayName=$4
+  local raw
+  local matching
+  local liveMatching
+  shift 4
 
+  capture_oci raw "$@" --output json
+  [[ -n ${raw} ]] || raw='{"data":[]}'
+  matching=$(jq -c --arg name "${displayName}" \
+    '[(.data // [])[] | select(."display-name" == $name)]' <<< "${raw}") \
+    || die "could not parse ${resourceType} discovery"
+  liveMatching=$(jq -c '
+    [.[] | select((."lifecycle-state" | ascii_upcase) != "DELETED"
+      and (."lifecycle-state" | ascii_upcase) != "TERMINATED")]
+  ' <<< "${matching}") || die "could not classify ${resourceType} lifecycle states"
+  if [[ $(jq -r 'length' <<< "${liveMatching}") -gt 1 ]]; then
+    jq -r --arg type "${resourceType}" '
+      .[] | "\($type) name=\(."display-name") ocid=\(.id) state=\(."lifecycle-state")"
+    ' <<< "${liveMatching}" >&2
+    die "multiple live ${resourceType} resources named ${displayName} were found in ${OKE_VCN_OCID}"
+  fi
+  printf -v "${ocidVariable}" '%s' \
+    "$(jq -r '.[0].id // empty' <<< "${liveMatching}")"
+  printf -v "${stateVariable}" '%s' \
+    "$(jq -r '.[0]."lifecycle-state" // empty' <<< "${liveMatching}")"
+}
+
+lookup_network_resources() {
   OKE_IGW_OCID=""
+  OKE_IGW_STATE=""
   OKE_NATGW_OCID=""
+  OKE_NATGW_STATE=""
   OKE_PUBLIC_RT_OCID=""
+  OKE_PUBLIC_RT_STATE=""
   OKE_PRIVATE_RT_OCID=""
+  OKE_PRIVATE_RT_STATE=""
   OKE_PUBLIC_SL_OCID=""
+  OKE_PUBLIC_SL_STATE=""
   OKE_PRIVATE_SL_OCID=""
+  OKE_PRIVATE_SL_STATE=""
   OKE_CP_SUBNET_OCID=""
+  OKE_CP_SUBNET_STATE=""
   OKE_WORKERS_SUBNET_OCID=""
+  OKE_WORKERS_SUBNET_STATE=""
   OKE_LB_SUBNET_OCID=""
+  OKE_LB_SUBNET_STATE=""
   [[ -z ${OKE_VCN_OCID} ]] && return 0
 
-  capture_oci OKE_IGW_OCID network internet-gateway list \
+  lookup_named_network_resource OKE_IGW_OCID OKE_IGW_STATE \
+    "internet gateway" "${OKE_CLUSTER_NAME}-igw" \
+    network internet-gateway list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-igw" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_NATGW_OCID network nat-gateway list \
+    --all
+  lookup_named_network_resource OKE_NATGW_OCID OKE_NATGW_STATE \
+    "NAT gateway" "${OKE_CLUSTER_NAME}-natgw" \
+    network nat-gateway list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-natgw" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_PUBLIC_RT_OCID network route-table list \
+    --all
+  lookup_named_network_resource OKE_PUBLIC_RT_OCID OKE_PUBLIC_RT_STATE \
+    "route table" "${OKE_CLUSTER_NAME}-rt-public" \
+    network route-table list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-rt-public" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_PRIVATE_RT_OCID network route-table list \
+    --all
+  lookup_named_network_resource OKE_PRIVATE_RT_OCID OKE_PRIVATE_RT_STATE \
+    "route table" "${OKE_CLUSTER_NAME}-rt-private" \
+    network route-table list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-rt-private" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_PUBLIC_SL_OCID network security-list list \
+    --all
+  lookup_named_network_resource OKE_PUBLIC_SL_OCID OKE_PUBLIC_SL_STATE \
+    "security list" "${OKE_CLUSTER_NAME}-sl-public" \
+    network security-list list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-sl-public" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_PRIVATE_SL_OCID network security-list list \
+    --all
+  lookup_named_network_resource OKE_PRIVATE_SL_OCID OKE_PRIVATE_SL_STATE \
+    "security list" "${OKE_CLUSTER_NAME}-sl-private" \
+    network security-list list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-sl-private" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_CP_SUBNET_OCID network subnet list \
+    --all
+  lookup_named_network_resource OKE_CP_SUBNET_OCID OKE_CP_SUBNET_STATE \
+    "subnet" "${OKE_CLUSTER_NAME}-subnet-cp" \
+    network subnet list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-subnet-cp" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_WORKERS_SUBNET_OCID network subnet list \
+    --all
+  lookup_named_network_resource OKE_WORKERS_SUBNET_OCID OKE_WORKERS_SUBNET_STATE \
+    "subnet" "${OKE_CLUSTER_NAME}-subnet-workers" \
+    network subnet list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-subnet-workers" \
-    --query 'data[0].id' \
-    --raw-output
-  capture_oci OKE_LB_SUBNET_OCID network subnet list \
+    --all
+  lookup_named_network_resource OKE_LB_SUBNET_OCID OKE_LB_SUBNET_STATE \
+    "subnet" "${OKE_CLUSTER_NAME}-subnet-lb" \
+    network subnet list \
     --region "${OCI_REGION}" \
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-subnet-lb" \
-    --query 'data[0].id' \
-    --raw-output
+    --all
+}
+
+wait_for_terminal_get() {
+  local resourceType=$1
+  local resourceOcid=$2
+  local terminalState=$3
+  local attempts
+  local attempt
+  local output
+  local state
+  shift 3
+
+  attempts=$((OKE_DELETE_MAX_WAIT_SECONDS / OKE_DELETE_WAIT_INTERVAL_SECONDS + 1))
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if output=$(oci "$@" \
+      --region "${OCI_REGION}" \
+      --query 'data."lifecycle-state"' \
+      --raw-output \
+      --profile "${OCI_CLI_PROFILE}" 2>&1); then
+      state=${output}
+      if [[ ${state} == "${terminalState}" ]]; then
+        return 0
+      fi
+    elif [[ ${output} == *"NotAuthorizedOrNotFound"* || ${output} == *"\"status\": 404"* ]]; then
+      return 0
+    else
+      printf '%s\n' "${output}" >&2
+      die "OCI lookup failed while waiting for ${resourceType} ${resourceOcid}"
+    fi
+
+    if ((attempt < attempts)); then
+      sleep "${OKE_DELETE_WAIT_INTERVAL_SECONDS}"
+    fi
+  done
+  die "${resourceType} ${resourceOcid} did not reach ${terminalState} (last state: ${state:-unknown})"
+}
+
+delete_cluster_record() {
+  local clusterOcid=$1
+  local clusterState=$2
+  local deleteStatus
+  if [[ ${clusterState} == "DELETING" ]]; then
+    wait_for_terminal_get "OKE cluster" "${clusterOcid}" DELETED \
+      ce cluster get --cluster-id "${clusterOcid}"
+  else
+    capture_oci deleteStatus ce cluster delete \
+      --region "${OCI_REGION}" \
+      --cluster-id "${clusterOcid}" \
+      --force \
+      --max-wait-seconds "${OKE_DELETE_MAX_WAIT_SECONDS}" \
+      --wait-interval-seconds "${OKE_DELETE_WAIT_INTERVAL_SECONDS}" \
+      --wait-for-state SUCCEEDED \
+      --wait-for-state FAILED \
+      --query 'data.status' \
+      --raw-output
+    [[ ${deleteStatus} == "SUCCEEDED" ]] \
+      || die "OKE cluster delete work request for ${clusterOcid} ended in ${deleteStatus:-an unknown state}"
+  fi
+}
+
+delete_network_record() {
+  local resourceCommand=$1
+  local resourceOcid=$2
+  local resourceState=$3
+  local idFlag=$4
+  if [[ ${resourceState} == "TERMINATING" || ${resourceState} == "DELETING" ]]; then
+    wait_for_terminal_get "${resourceCommand}" "${resourceOcid}" TERMINATED \
+      network "${resourceCommand}" get "${idFlag}" "${resourceOcid}"
+  else
+    run_oci network "${resourceCommand}" delete \
+      --region "${OCI_REGION}" \
+      "${idFlag}" "${resourceOcid}" \
+      --force \
+      --max-wait-seconds "${OKE_DELETE_MAX_WAIT_SECONDS}" \
+      --wait-interval-seconds "${OKE_DELETE_WAIT_INTERVAL_SECONDS}" \
+      --wait-for-state TERMINATED
+  fi
 }
 
 delete_oke() {
+  local clusterRecords
+  local liveClusterRecords
+  local ownedAnyClusterRecords
+  local ownedClusterRecords
+  local vcnRecords
+  local liveVcnRecords
+  local ownedAnyVcnRecords
+  local ownedVcnRecords
+  local clusterOcid
+  local clusterState
+  local vcnRecord
+
   printf "Deleting OKE cluster and network resources for %s\n" "${OKE_CLUSTER_NAME}"
-  lookup_cluster
-  if [[ -n ${OKE_CLUSTER_OCID} ]]; then
-    run_oci ce cluster delete \
-      --region "${OCI_REGION}" \
-      --cluster-id "${OKE_CLUSTER_OCID}" \
-      --force \
-      --max-wait-seconds 1800 \
-      --wait-interval-seconds 30 \
-      --wait-for-state SUCCEEDED \
-      --wait-for-state FAILED
-    delete_context
+  clusterRecords=$(list_oke_cluster_records) || die "could not list OKE clusters for teardown"
+  liveClusterRecords=$(oke_live_records "${clusterRecords}") \
+    || die "could not classify OKE cluster lifecycle states"
+  ownedAnyClusterRecords=$(oke_owned_records "${clusterRecords}") \
+    || die "could not classify OKE cluster ownership"
+  ownedClusterRecords=$(oke_owned_records "${liveClusterRecords}") \
+    || die "could not classify OKE cluster ownership"
+  if [[ $(oke_record_count "${ownedClusterRecords}") -eq 0 ]]; then
+    printf "No live tagged OKE cluster %s was found\n" "${OKE_CLUSTER_NAME}"
   else
-    printf "OKE cluster %s was not found\n" "${OKE_CLUSTER_NAME}"
+    while IFS=$'\t' read -r clusterOcid clusterState; do
+      printf "Deleting OKE cluster %s (state %s)\n" "${clusterOcid}" "${clusterState}"
+      delete_cluster_record "${clusterOcid}" "${clusterState}"
+    done < <(jq -r '.[] | [.id, .state] | @tsv' <<< "${ownedClusterRecords}")
   fi
 
-  lookup_network
-  if [[ -z ${OKE_CLUSTER_OCID} && -n ${OKE_VCN_OCID} ]]; then
+  vcnRecords=$(list_oke_vcn_records) || die "could not list OKE VCNs for teardown"
+  liveVcnRecords=$(oke_live_records "${vcnRecords}") \
+    || die "could not classify OKE VCN lifecycle states"
+  ownedAnyVcnRecords=$(oke_owned_records "${vcnRecords}") \
+    || die "could not classify OKE VCN ownership"
+  ownedVcnRecords=$(oke_owned_records "${liveVcnRecords}") \
+    || die "could not classify OKE VCN ownership"
+  if [[ $(oke_record_count "${ownedVcnRecords}") -eq 0 ]]; then
+    printf "No live tagged VCN %s was found\n" "${OKE_VCN_NAME}"
+  fi
+
+  while IFS= read -r vcnRecord; do
+    OKE_VCN_OCID=$(jq -r '.id' <<< "${vcnRecord}")
+    OKE_VCN_STATE=$(jq -r '.state' <<< "${vcnRecord}")
+    OKE_DEFAULT_RT_OCID=$(jq -r '.default_route_table_id // empty' <<< "${vcnRecord}")
+    OKE_DEFAULT_SL_OCID=$(jq -r '.default_security_list_id // empty' <<< "${vcnRecord}")
+    OKE_DEFAULT_DHCP_OCID=$(jq -r '.default_dhcp_options_id // empty' <<< "${vcnRecord}")
+    printf "Deleting tagged VCN %s (state %s)\n" "${OKE_VCN_OCID}" "${OKE_VCN_STATE}"
+
+    if [[ ${OKE_VCN_STATE} != "TERMINATING" && ${OKE_VCN_STATE} != "DELETING" ]]; then
+      lookup_network_resources
+      [[ -n ${OKE_LB_SUBNET_OCID} ]] \
+        && delete_network_record subnet "${OKE_LB_SUBNET_OCID}" "${OKE_LB_SUBNET_STATE}" --subnet-id
+      [[ -n ${OKE_WORKERS_SUBNET_OCID} ]] \
+        && delete_network_record subnet "${OKE_WORKERS_SUBNET_OCID}" "${OKE_WORKERS_SUBNET_STATE}" --subnet-id
+      [[ -n ${OKE_CP_SUBNET_OCID} ]] \
+        && delete_network_record subnet "${OKE_CP_SUBNET_OCID}" "${OKE_CP_SUBNET_STATE}" --subnet-id
+
+      [[ -n ${OKE_PUBLIC_SL_OCID} ]] \
+        && delete_network_record security-list "${OKE_PUBLIC_SL_OCID}" "${OKE_PUBLIC_SL_STATE}" --security-list-id
+      [[ -n ${OKE_PRIVATE_SL_OCID} ]] \
+        && delete_network_record security-list "${OKE_PRIVATE_SL_OCID}" "${OKE_PRIVATE_SL_STATE}" --security-list-id
+
+      [[ -n ${OKE_PRIVATE_RT_OCID} ]] \
+        && delete_network_record route-table "${OKE_PRIVATE_RT_OCID}" "${OKE_PRIVATE_RT_STATE}" --rt-id
+      [[ -n ${OKE_PUBLIC_RT_OCID} ]] \
+        && delete_network_record route-table "${OKE_PUBLIC_RT_OCID}" "${OKE_PUBLIC_RT_STATE}" --rt-id
+
+      [[ -n ${OKE_NATGW_OCID} ]] \
+        && delete_network_record nat-gateway "${OKE_NATGW_OCID}" "${OKE_NATGW_STATE}" --nat-gateway-id
+      [[ -n ${OKE_IGW_OCID} ]] \
+        && delete_network_record internet-gateway "${OKE_IGW_OCID}" "${OKE_IGW_STATE}" --ig-id
+    fi
+
+    printf "OCI will remove VCN defaults with the VCN: route-table=%s security-list=%s dhcp-options=%s\n" \
+      "${OKE_DEFAULT_RT_OCID:-unknown}" "${OKE_DEFAULT_SL_OCID:-unknown}" "${OKE_DEFAULT_DHCP_OCID:-unknown}"
+    delete_network_record vcn "${OKE_VCN_OCID}" "${OKE_VCN_STATE}" --vcn-id
+  done < <(jq -c '.[]' <<< "${ownedVcnRecords}")
+
+  if [[ $(oke_record_count "${ownedAnyClusterRecords}") -gt 0 \
+      || $(oke_record_count "${ownedAnyVcnRecords}") -gt 0 ]]; then
     delete_context
   fi
-  if [[ -z ${OKE_VCN_OCID} ]]; then
-    printf "VCN %s was not found\n" "${OKE_VCN_NAME}"
-    return 0
+
+  if ! oke_verify_no_live_owned_parents; then
+    die "${OKE_LIFECYCLE_ERROR:-teardown verification failed}"
   fi
-
-  [[ -n ${OKE_LB_SUBNET_OCID} ]] && run_oci network subnet delete \
-    --region "${OCI_REGION}" --subnet-id "${OKE_LB_SUBNET_OCID}" \
-    --force --wait-for-state TERMINATED
-  [[ -n ${OKE_WORKERS_SUBNET_OCID} ]] && run_oci network subnet delete \
-    --region "${OCI_REGION}" --subnet-id "${OKE_WORKERS_SUBNET_OCID}" \
-    --force --wait-for-state TERMINATED
-  [[ -n ${OKE_CP_SUBNET_OCID} ]] && run_oci network subnet delete \
-    --region "${OCI_REGION}" --subnet-id "${OKE_CP_SUBNET_OCID}" \
-    --force --wait-for-state TERMINATED
-
-  [[ -n ${OKE_PUBLIC_SL_OCID} ]] && run_oci network security-list delete \
-    --region "${OCI_REGION}" --security-list-id "${OKE_PUBLIC_SL_OCID}" \
-    --force --wait-for-state TERMINATED
-  [[ -n ${OKE_PRIVATE_SL_OCID} ]] && run_oci network security-list delete \
-    --region "${OCI_REGION}" --security-list-id "${OKE_PRIVATE_SL_OCID}" \
-    --force --wait-for-state TERMINATED
-
-  [[ -n ${OKE_PRIVATE_RT_OCID} ]] && run_oci network route-table delete \
-    --region "${OCI_REGION}" --rt-id "${OKE_PRIVATE_RT_OCID}" \
-    --force --wait-for-state TERMINATED
-  [[ -n ${OKE_PUBLIC_RT_OCID} ]] && run_oci network route-table delete \
-    --region "${OCI_REGION}" --rt-id "${OKE_PUBLIC_RT_OCID}" \
-    --force --wait-for-state TERMINATED
-
-  [[ -n ${OKE_NATGW_OCID} ]] && run_oci network nat-gateway delete \
-    --region "${OCI_REGION}" --nat-gateway-id "${OKE_NATGW_OCID}" \
-    --force --wait-for-state TERMINATED
-  [[ -n ${OKE_IGW_OCID} ]] && run_oci network internet-gateway delete \
-    --region "${OCI_REGION}" --ig-id "${OKE_IGW_OCID}" \
-    --force --wait-for-state TERMINATED
-
-  run_oci network vcn delete \
-    --region "${OCI_REGION}" --vcn-id "${OKE_VCN_OCID}" \
-    --force --wait-for-state TERMINATED
   printf "Deleted OKE infrastructure for %s\n" "${OKE_CLUSTER_NAME}"
 }
 
 create_oke() {
   targetContext="${OKE_CLUSTER_NAME}-oke"
   if [[ ${RESUME_EXISTING} == true ]]; then
-    lookup_cluster
-    [[ -n ${OKE_CLUSTER_OCID} ]] \
-      || die "cannot resume: tagged OKE cluster ${OKE_CLUSTER_NAME} was not found"
-    lookup_network
-    [[ -n ${OKE_VCN_OCID} && -n ${OKE_CP_SUBNET_OCID} && -n ${OKE_WORKERS_SUBNET_OCID} && -n ${OKE_LB_SUBNET_OCID} ]] \
-      || die "cannot resume: one or more tagged OKE network resources could not be found"
+    if ! oke_select_resume_parents; then
+      die "${OKE_LIFECYCLE_ERROR:-cannot resume the tagged OKE deployment}"
+    fi
+    OKE_CLUSTER_OCID=${OKE_RESUME_CLUSTER_OCID}
+    OKE_CLUSTER_STATE=${OKE_RESUME_CLUSTER_STATE}
+    OKE_VCN_OCID=${OKE_RESUME_VCN_OCID}
+    OKE_VCN_STATE=${OKE_RESUME_VCN_STATE}
+    lookup_network_resources
+    if ! oke_validate_resume_network; then
+      die "${OKE_LIFECYCLE_ERROR:-cannot validate the tagged OKE network}"
+    fi
     capture_oci existingK8sVersion ce cluster get \
       --cluster-id "${OKE_CLUSTER_OCID}" \
       --region "${OCI_REGION}" \
@@ -300,14 +466,7 @@ create_oke() {
     [[ -n ${OCI_AD} ]] || die "could not determine an OCI availability domain"
     printf "Resuming OKE %s (%s) in %s\n" "${OKE_CLUSTER_NAME}" "${K8S_VERSION}" "${OCI_REGION}"
   else
-    if kubectl config get-contexts -o name 2>/dev/null | grep -Fxq "${targetContext}"; then
-      die "kubeconfig context ${targetContext} already exists; remove it or choose another OKE_CLUSTER_NAME"
-    fi
-
-    lookup_name_collisions
-    if [[ -n ${existingCluster} || -n ${existingVcn} ]]; then
-      die "resources named ${OKE_CLUSTER_NAME} already exist; use --resume for a tagged partial deployment, or -d before recreating it"
-    fi
+    preflight_create
     if [[ -z ${K8S_VERSION} ]]; then
       capture_oci K8S_VERSION ce cluster-options get \
         --cluster-option-id all \
@@ -347,6 +506,7 @@ create_oke() {
     --vcn-id "${OKE_VCN_OCID}" \
     --is-enabled true \
     --display-name "${OKE_CLUSTER_NAME}-igw" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -355,6 +515,7 @@ create_oke() {
     --compartment-id "${OCI_COMPARTMENT_OCID}" \
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-natgw" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -366,6 +527,7 @@ create_oke() {
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-rt-public" \
     --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"${OKE_IGW_OCID}\"}]" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -375,6 +537,7 @@ create_oke() {
     --vcn-id "${OKE_VCN_OCID}" \
     --display-name "${OKE_CLUSTER_NAME}-rt-private" \
     --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"${OKE_NATGW_OCID}\"}]" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -407,6 +570,7 @@ create_oke() {
     --display-name "${OKE_CLUSTER_NAME}-sl-public" \
     --egress-security-rules "${EGRESS_RULES}" \
     --ingress-security-rules "${PUBLIC_INGRESS_RULES}" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -417,6 +581,7 @@ create_oke() {
     --display-name "${OKE_CLUSTER_NAME}-sl-private" \
     --egress-security-rules "${EGRESS_RULES}" \
     --ingress-security-rules "${PRIVATE_INGRESS_RULES}" \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -432,6 +597,7 @@ create_oke() {
     --route-table-id "${OKE_PUBLIC_RT_OCID}" \
     --security-list-ids "[\"${OKE_PUBLIC_SL_OCID}\"]" \
     --prohibit-public-ip-on-vnic false \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -445,6 +611,7 @@ create_oke() {
     --route-table-id "${OKE_PRIVATE_RT_OCID}" \
     --security-list-ids "[\"${OKE_PRIVATE_SL_OCID}\"]" \
     --prohibit-public-ip-on-vnic true \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -458,6 +625,7 @@ create_oke() {
     --route-table-id "${OKE_PUBLIC_RT_OCID}" \
     --security-list-ids "[\"${OKE_PUBLIC_SL_OCID}\"]" \
     --prohibit-public-ip-on-vnic false \
+    --freeform-tags "${OKE_RESOURCE_TAGS}" \
     --wait-for-state AVAILABLE \
     --query 'data.id' \
     --raw-output
@@ -700,6 +868,10 @@ WORKER_SUBNET_CIDR="${WORKER_SUBNET_CIDR:-10.0.1.0/24}"
 LOAD_BALANCER_SUBNET_CIDR="${LOAD_BALANCER_SUBNET_CIDR:-10.0.2.0/24}"
 API_INGRESS_CIDR="${API_INGRESS_CIDR:-0.0.0.0/0}"
 LOAD_BALANCER_INGRESS_CIDR="${LOAD_BALANCER_INGRESS_CIDR:-0.0.0.0/0}"
+OKE_DISCOVERY_RETRY_ATTEMPTS="${OKE_DISCOVERY_RETRY_ATTEMPTS:-6}"
+OKE_DISCOVERY_RETRY_DELAY_SECONDS="${OKE_DISCOVERY_RETRY_DELAY_SECONDS:-10}"
+OKE_DELETE_MAX_WAIT_SECONDS="${OKE_DELETE_MAX_WAIT_SECONDS:-1800}"
+OKE_DELETE_WAIT_INTERVAL_SECONDS="${OKE_DELETE_WAIT_INTERVAL_SECONDS:-30}"
 
 [[ ${OKE_CLUSTER_NAME} =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
   || die "OKE_CLUSTER_NAME must be a lowercase DNS-style name"
@@ -713,6 +885,10 @@ OKE_RESOURCE_TAGS=$(jq -cn --arg name "${OKE_CLUSTER_NAME}" \
 validate_positive_integer GENERAL_NODE_COUNT "${GENERAL_NODE_COUNT}"
 validate_positive_integer SCYLLA_NODE_COUNT "${SCYLLA_NODE_COUNT}"
 validate_positive_integer NODE_BOOT_VOLUME_GBS "${NODE_BOOT_VOLUME_GBS}"
+validate_positive_integer OKE_DISCOVERY_RETRY_ATTEMPTS "${OKE_DISCOVERY_RETRY_ATTEMPTS}"
+validate_positive_integer OKE_DISCOVERY_RETRY_DELAY_SECONDS "${OKE_DISCOVERY_RETRY_DELAY_SECONDS}"
+validate_positive_integer OKE_DELETE_MAX_WAIT_SECONDS "${OKE_DELETE_MAX_WAIT_SECONDS}"
+validate_positive_integer OKE_DELETE_WAIT_INTERVAL_SECONDS "${OKE_DELETE_WAIT_INTERVAL_SECONDS}"
 [[ ${SCYLLA_NODE_COUNT} -eq 3 ]] \
   || die "SCYLLA_NODE_COUNT must be exactly 3 for the fixed three-rack deployment"
 [[ ${SCYLLA_NODE_SHAPE} == *DenseIO* ]] \
@@ -757,7 +933,11 @@ case "${1:-}" in
   -d|-x)
     delete_oke
     ;;
+  -p|--preflight)
+    preflight_create
+    printf "OKE create preflight passed for %s; no OCI resources were changed\n" "${OKE_CLUSTER_NAME}"
+    ;;
   *)
-    die "usage: ${BASH_SOURCE[0]##*/} [--resume|-r|-d|-x]"
+    die "usage: ${BASH_SOURCE[0]##*/} [--resume|-r|-d|-x|--preflight|-p]"
     ;;
 esac
